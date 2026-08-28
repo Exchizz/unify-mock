@@ -19,6 +19,7 @@ import struct
 import sys
 import threading
 import time
+import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
@@ -272,20 +273,33 @@ def build_arm_message(media_port, stream_name):
     return build_envelope("ChangeVideoSettings", payload, response_expected=True)
 
 
-# POSIX TZ string sent in ChangeDeviceSettings (note: empirically this field
-# appears to be camera->controller reporting only, not a working setter —
-# kept configurable in case that changes on other firmware/models).
-DEVICE_TIMEZONE = os.environ.get("DEVICE_TIMEZONE", "CET-1CEST,M3.5.0,M10.5.0/3")
+# IANA timezone name sent in ChangeDeviceSettings, e.g. "Europe/Copenhagen".
+#
+# This MUST be an IANA/Olson name, not a POSIX TZ string. The camera resolves
+# it against /usr/share/zoneinfo and symlinks /etc/localtime at it. A POSIX
+# string such as "CET-1CEST,M3.5.0,M10.5.0/3" is silently rejected — the
+# firmware splits it on "/" and logs "Not found relevant timezone 3".
+# Verified on a UVC G6 Turret running 5.0.83.
+DEVICE_TIMEZONE = os.environ.get("DEVICE_TIMEZONE", "Europe/Copenhagen")
 
 
 def build_device_settings_message(camera_name):
     """Tell the camera its local timezone, so its OSD/overlay clock renders
-    local time instead of defaulting to UTC. This is a real value (not a
-    null query) so the camera applies it (see unifi-cam-proxy base.py
-    process_device_settings / SPEC.md 2.5 "nulls are questions")."""
+    local time instead of defaulting to UTC.
+
+    The camera's ubnt_ctlserver handles this in updateSettings(): it resolves
+    the IANA name under /usr/share/zoneinfo, points /etc/localtime at it,
+    writes system.timezone into its persistent config, and derives the
+    mains-frequency anti-flicker mode for the region. /etc is tmpfs, but the
+    symlink is recreated from the persistent config on every boot, so this
+    only needs sending once at adoption.
+
+    `persists` asks the camera to write the value to flash rather than only
+    applying it to the running system."""
     payload = {
         "name": camera_name,
         "timezone": DEVICE_TIMEZONE,
+        "persists": True,
     }
     return build_envelope("ChangeDeviceSettings", payload, response_expected=True)
 
@@ -321,16 +335,35 @@ def build_ack_response(msg):
     }
 
 
+def _make_tls_context():
+    """Build the server-side TLS context.
+
+    ssl.wrap_socket() was removed in Python 3.12, so use SSLContext. The
+    camera's client is old, so allow the widest set of protocols and ciphers
+    the local OpenSSL will accept rather than the modern defaults."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=CERTFILE, keyfile=KEYFILE)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1
+    except (AttributeError, ValueError):
+        pass
+    try:
+        ctx.set_ciphers("DEFAULT@SECLEVEL=0")
+    except ssl.SSLError:
+        try:
+            ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+        except ssl.SSLError:
+            pass
+    return ctx
+
+
 def handle(conn, addr):
     log("=== TCP connection from %s ===" % (addr,))
     tls_conn = None
     try:
-        tls_conn = ssl.wrap_socket(
-            conn,
-            server_side=True,
-            certfile=CERTFILE,
-            keyfile=KEYFILE,
-        )
+        tls_conn = _make_tls_context().wrap_socket(conn, server_side=True)
         log("=== TLS handshake OK with %s (cipher=%s) ===" % (addr, tls_conn.cipher()))
 
         raw = recv_until(tls_conn, b"\r\n\r\n")

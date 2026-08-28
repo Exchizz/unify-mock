@@ -211,7 +211,7 @@ bandwidth scales linearly with the number of cameras.
 | `WEB_HOST`        | `0.0.0.0`                          | Bind address for the status web interface. Set to `127.0.0.1` to keep it off the LAN. |
 | `WEB_PORT`        | `18081`                            | Port for the status web interface.                                        |
 | `STREAM_IDLE_TIMEOUT` | `10`                           | Seconds without forwarded data after which a camera is shown as offline, even if its TCP connection is still open. |
-| `DEVICE_TIMEZONE` | `CET-1CEST,M3.5.0,M10.5.0/3`       | POSIX TZ string (Copenhagen/Central European) sent in `ChangeDeviceSettings`. Note: on the tested camera this field is reporting-only and does not actually change the camera's clock — see [Setting the camera's timezone](#setting-the-cameras-timezone). |
+| `DEVICE_TIMEZONE` | `Europe/Copenhagen`                | IANA zone name pushed to the camera in `ChangeDeviceSettings` at adoption, so its clock and OSD show local time instead of UTC. Must be an IANA name, not a POSIX TZ string — see [Setting the camera's timezone](#setting-the-cameras-timezone). |
 | `CERT_DIR`        | directory containing the script    | Directory to read/write `cert.pem`/`key.pem`.                             |
 
 The two port bases are spaced far apart so the ranges cannot collide as the
@@ -280,61 +280,77 @@ parse the destination.
 
 ### Setting the camera's timezone
 
-The `DEVICE_TIMEZONE` env var is sent in `ChangeDeviceSettings`, but on the
-tested firmware that field is reporting-only and does **not** move the
-camera's OSD clock. To actually change it you need shell access on the camera
-and must write its persistent config directly.
+The camera's clock defaults to UTC. This controller sets it automatically at
+adoption by sending `ChangeDeviceSettings` with the `DEVICE_TIMEZONE` value —
+no shell access on the camera is needed, and the setting survives reboots.
 
-SSH into the camera (default credentials `ubnt`/`ubnt` unless changed), then
-for **Copenhagen**:
+The value **must be an IANA/Olson zone name**, e.g. `Europe/Copenhagen`:
 
-```sh
-ubnt_system_cfg write system.timezone 'CET-1CEST,M3.5.0,M10.5.0/3'
-reboot
+```yaml
+environment:
+  - DEVICE_TIMEZONE=Europe/Copenhagen
 ```
 
-Some firmware builds keep the setter under a different name; if
-`ubnt_system_cfg` isn't on `PATH`, edit the file directly instead:
+A **POSIX TZ string like `CET-1CEST,M3.5.0,M10.5.0/3` does not work** — the
+firmware splits it on `/` and looks for a zone literally named `3`, logging:
 
-```sh
-sed -i '/^system\.timezone=/d' /etc/persistent/system.cfg
-echo "system.timezone=CET-1CEST,M3.5.0,M10.5.0/3" >> /etc/persistent/system.cfg
-cfgmtd -w -p /etc/persistent/    # commit to flash, else the reboot loses it
-reboot
+```
+ctl[1545]: Not found relevant timezone 3 [ubnt_ctlserver:CtlServer.cpp:updateSettings:634]
 ```
 
-Verify after it comes back up:
+The zone must also exist in the camera's own `/usr/share/zoneinfo`, which
+carries the standard IANA tree (`Europe/Copenhagen`, `America/New_York`, …).
+
+#### What the camera does with it
+
+On receiving the message, the camera's `ubnt_ctlserver`:
+
+1. resolves the name under `/usr/share/zoneinfo`,
+2. points `/etc/localtime` at it,
+3. writes `system.timezone` into `/etc/persistent/system.cfg`, and
+4. derives the regional mains frequency for anti-flicker
+   (`SetAutoAeModeByTimezone` — 50 Hz for Europe, 60 Hz for North America).
+
+`/etc` is tmpfs, so the symlink itself does not survive a reboot — but the
+camera recreates it from its persistent config on every boot. Sending the
+message once at adoption is enough.
+
+#### Verifying
+
+Over SSH on the camera:
 
 ```sh
-grep system.timezone /etc/persistent/system.cfg
-date
+date                                     # should show local time, e.g. CEST
+ls -l /etc/localtime                     # -> /usr/share/zoneinfo/Europe/Copenhagen
+grep timezone /etc/persistent/system.cfg # system.timezone=Europe/Copenhagen
 ```
 
-This is a **POSIX TZ string**, not an IANA name like `Europe/Copenhagen` —
-the camera has no tz database. Reading `CET-1CEST,M3.5.0,M10.5.0/3`:
+You can also query it without changing anything:
 
-| Part | Meaning |
-|------|---------|
-| `CET` | standard-time abbreviation |
-| `-1` | offset **west** of UTC; the sign is inverted, so `-1` means UTC**+**1 |
-| `CEST` | daylight-saving abbreviation (offset defaults to standard + 1h) |
-| `M3.5.0` | DST starts: month 3, last (`5`) Sunday (`0`) |
-| `M10.5.0/3` | DST ends: month 10, last Sunday, at 03:00 |
+```sh
+ubnt_ipc_cli -z -r=1 -T=ubnt_ctlserver -m='{"functionName":"GetTimezone"}'
+```
 
-The inverted sign is the usual trap — `CET-1CEST` is Central European Time
-at UTC+1, not UTC−1. The same string covers Oslo, Stockholm, Berlin, Paris
-and Amsterdam. It is also this project's `DEVICE_TIMEZONE` default, so if
-you're in Copenhagen you only need the camera-side command above.
+or set it directly on the camera, bypassing the controller entirely (note the
+fields sit at the **top level** for the local IPC form, not nested under
+`payload`):
+
+```sh
+ubnt_ipc_cli -z -r=1 -T=ubnt_ctlserver \
+  -m='{"functionName":"ChangeDeviceSettings","timezone":"Europe/Copenhagen","persists":true}'
+```
+
+The `persists` flag asks the camera to write the value to flash rather than
+only applying it to the running system.
+
+#### Note on the OSD clock
+
+Long-running processes cache the zone at startup, so a camera that was
+already streaming may keep rendering UTC on its overlay until it restarts.
+A reboot — or the camera's normal re-adoption cycle — clears this.
 
 ## Known limitations
 
-- `ChangeDeviceSettings`'s `timezone` field appears to be **camera → 
-  controller reporting only** on the tested firmware (UVC G6 Turret
-  5.0.83) — sending it does not change the camera's on-screen clock. The
-  camera's actual timezone lives in its own persistent config
-  (`/etc/persistent/system.cfg`, key `system.timezone`) and requires
-  camera-side shell access plus a reboot to take effect — see
-  [Setting the camera's timezone](#setting-the-cameras-timezone).
 - `ChangeSoundLedSettings` is implemented as a best-effort controller→
   camera setter based on `unifi-cam-proxy`'s protocol implementation, but
   has not been exhaustively verified across camera models/firmware.
