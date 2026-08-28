@@ -15,6 +15,7 @@ import random
 import socket
 import ssl
 import struct
+import sys
 import threading
 import time
 
@@ -44,7 +45,6 @@ KEYFILE = os.path.join(CERT_DIR, "key.pem")
 
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-LOG_FILE = os.environ.get("LOG_FILE", "/tmp/log.log")
 _log_lock = threading.Lock()
 
 if not CONTROLLER_HOST:
@@ -63,16 +63,21 @@ except socket.gaierror as e:
         (CONTROLLER_HOST, e))
 
 
-def log(msg):
-    """Print to stdout and append to LOG_FILE, thread-safe, flushed immediately."""
-    line = "%s %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"), msg)
-    print(line)
+def _emit(stream, msg):
+    line = "%s %s\n" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"), msg)
     with _log_lock:
-        try:
-            with open(LOG_FILE, "a") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+        stream.write(line)
+        stream.flush()
+
+
+def log(msg):
+    """Write an informational message to stdout, thread-safe and unbuffered."""
+    _emit(sys.stdout, msg)
+
+
+def log_err(msg):
+    """Write an error message to stderr, thread-safe and unbuffered."""
+    _emit(sys.stderr, msg)
 
 
 def hexdump(data):
@@ -289,7 +294,7 @@ def handle(conn, addr):
 
         raw = recv_until(tls_conn, b"\r\n\r\n")
         if b"\r\n\r\n" not in raw:
-            log("--- %s: no complete HTTP header received ---" % (addr,))
+            log_err("--- %s: no complete HTTP header received ---" % (addr,))
             return
         request_line, headers, leftover = parse_http_headers(raw)
         log("--- HTTP request from %s: %s ---" % (addr, request_line))
@@ -298,7 +303,7 @@ def handle(conn, addr):
 
         ws_key = headers.get("sec-websocket-key")
         if not ws_key:
-            log("--- %s: not a websocket upgrade, no Sec-WebSocket-Key ---" % (addr,))
+            log_err("--- %s: not a websocket upgrade, no Sec-WebSocket-Key ---" % (addr,))
             return
 
         accept = ws_accept_key(ws_key)
@@ -399,7 +404,7 @@ def handle(conn, addr):
                                     log("=== sending arm/ChangeVideoSettings to %s: %s ===" % (addr, arm_text))
                                     send_ws_frame(tls_conn, opcode, arm_text)
                                 except Exception as e:
-                                    log("=== failed to send arm message to %s: %r ===" % (addr, e))
+                                    log_err("=== failed to send arm message to %s: %r ===" % (addr, e))
 
                             def _send_device_settings():
                                 try:
@@ -409,7 +414,7 @@ def handle(conn, addr):
                                         % (DEVICE_TIMEZONE, addr, ds_text))
                                     send_ws_frame(tls_conn, opcode, ds_text)
                                 except Exception as e:
-                                    log("=== failed to send device-settings message to %s: %r ===" % (addr, e))
+                                    log_err("=== failed to send device-settings message to %s: %r ===" % (addr, e))
 
                             timer = threading.Timer(1.5, _send_arm)
                             timer.daemon = True
@@ -426,7 +431,7 @@ def handle(conn, addr):
                                     log("=== sending ChangeSoundLedSettings (LED off) to %s: %s ===" % (addr, led_text))
                                     send_ws_frame(tls_conn, opcode, led_text)
                                 except Exception as e:
-                                    log("=== failed to send LED-off message to %s: %r ===" % (addr, e))
+                                    log_err("=== failed to send LED-off message to %s: %r ===" % (addr, e))
 
                             led_timer = threading.Timer(3.5, _send_led_off)
                             led_timer.daemon = True
@@ -446,7 +451,7 @@ def handle(conn, addr):
                 log("--- %s: received close frame ---" % (addr,))
                 break
     except Exception as e:
-        log("--- %s error: %r ---" % (addr, e))
+        log_err("--- %s error: %r ---" % (addr, e))
     finally:
         try:
             if tls_conn is not None:
@@ -573,7 +578,7 @@ def handle_media(conn, addr):
     try:
         header = recv_exact(conn, 9)
         if header is None or header[:3] != b"FLV":
-            log("=== MEDIA %s: not an FLV header: %r ===" % (addr, header))
+            log_err("=== MEDIA %s: not an FLV header: %r ===" % (addr, header))
             return
         log("=== MEDIA %s: FLV header %s ===" % (addr, hexdump(header)))
         header_and_prevsize0 = header + struct.pack("!I", 0)
@@ -640,7 +645,7 @@ def handle_media(conn, addr):
                 log("=== MEDIA %s tag#%d type=%d size=%d clockrate=%d elapsed=%.2fs %s%s ===" %
                     (addr, tag_count, tag_type, data_size, clockrate, elapsed / 100000.0, fwd, extra))
     except Exception as e:
-        log("=== MEDIA %s error: %r ===" % (addr, e))
+        log_err("=== MEDIA %s error: %r ===" % (addr, e))
     finally:
         try:
             conn.close()

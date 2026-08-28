@@ -103,8 +103,11 @@ streams:
 | `FLV_HOST`        | `0.0.0.0`                          | Bind address for the clean-FLV consumer output.                           |
 | `FLV_PORT`        | `7551`                             | Port for the clean-FLV consumer output (point go2rtc here).               |
 | `DEVICE_TIMEZONE` | `CET-1CEST,M3.5.0,M10.5.0/3`       | POSIX TZ string sent in `ChangeDeviceSettings`. Note: on the tested camera this field is reporting-only and does not actually change the camera's clock — see [Known limitations](#known-limitations). |
-| `LOG_FILE`        | `/tmp/log.log`                     | Path to the append-only debug log (also printed to stdout).               |
 | `CERT_DIR`        | directory containing the script    | Directory to read/write `cert.pem`/`key.pem`.                             |
+
+Logs go to the container's standard streams: informational output on
+stdout, errors on stderr. Use `docker logs` (or your log driver) to read
+them — there is no log file.
 
 At startup the container validates that `CONTROLLER_HOST` resolves *from
 inside the container* (`socket.getaddrinfo`) and refuses to start if it

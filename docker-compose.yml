@@ -21,8 +21,6 @@ services:
       # MEDIA_PORT: "7550"
       # FLV_PORT: "7551"
       # DEVICE_TIMEZONE: "CET-1CEST,M3.5.0,M10.5.0/3"
-      LOG_FILE: "/var/log/unifi-controller/app.log"
       CERT_DIR: "/certs"
     volumes:
       - ./certs:/certs
-      - ./logs:/var/log/unifi-controller
