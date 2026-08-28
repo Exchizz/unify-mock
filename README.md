@@ -271,8 +271,12 @@ Protect console/inform URL (adjust to your adoption tooling), e.g.:
 
 ```
 ubnt_ipc_cli -T=ubnt_avclient -r=1 -x='response/statusCode' \
-  -m='{"functionName":"Adopt","hosts":["https://<this-host>:18080/inform"],"protocol":"wss"}'
+  -m='{"functionName":"Adopt","hosts":["<this-host>:18080/inform"],"protocol":"wss"}'
 ```
+
+The host entry carries no `https://` scheme — the transport is set by
+`"protocol":"wss"` instead, and including a scheme makes the camera fail to
+parse the destination.
 
 ## Known limitations
 

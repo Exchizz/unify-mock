@@ -1,7 +1,12 @@
 services:
   unifi-controller:
     build: .
-    image: ghcr.io/OWNER/REPO:latest
+    # Published by .github/workflows/docker-build.yml. GHCR requires a
+    # lowercase path, so Exchizz/unify-mock becomes exchizz/unify-mock.
+    # With `build:` present, `docker compose up` builds locally and tags
+    # this name; use `docker compose pull` to fetch the published image
+    # instead.
+    image: ghcr.io/exchizz/unify-mock:latest
     container_name: unifi-controller
     restart: unless-stopped
     # Host networking is strongly recommended: the camera dials this
