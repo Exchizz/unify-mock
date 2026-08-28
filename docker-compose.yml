@@ -1,0 +1,28 @@
+services:
+  unifi-controller:
+    build: .
+    image: ghcr.io/OWNER/REPO:latest
+    container_name: unifi-controller
+    restart: unless-stopped
+    # Host networking is strongly recommended: the camera dials this
+    # container's IP directly (TLS control channel + raw TCP media push),
+    # and go2rtc/Frigate on this same host pull the FLV output over
+    # 127.0.0.1. Bridge networking would require extra NAT/hairpin config
+    # for the camera-initiated connections.
+    network_mode: host
+    environment:
+      # Required: an address the camera can resolve/reach — this host's
+      # LAN IP, or a hostname if the camera has working DNS. The camera is
+      # told to dial this address back for its media (FLV) push after
+      # adoption.
+      CONTROLLER_HOST: "192.168.1.2"
+      # Optional overrides (defaults shown):
+      # LISTEN_PORT: "18080"
+      # MEDIA_PORT: "7550"
+      # FLV_PORT: "7551"
+      # DEVICE_TIMEZONE: "CET-1CEST,M3.5.0,M10.5.0/3"
+      LOG_FILE: "/var/log/unifi-controller/app.log"
+      CERT_DIR: "/certs"
+    volumes:
+      - ./certs:/certs
+      - ./logs:/var/log/unifi-controller
