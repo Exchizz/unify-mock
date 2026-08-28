@@ -30,16 +30,30 @@ PORT = int(os.environ.get("LISTEN_PORT", "18080"))
 # in every setup). CONTROLLER_IP is accepted as a deprecated alias.
 CONTROLLER_HOST = os.environ.get("CONTROLLER_HOST") or os.environ.get("CONTROLLER_IP")
 MEDIA_HOST = os.environ.get("MEDIA_HOST", "0.0.0.0")
-MEDIA_PORT = int(os.environ.get("MEDIA_PORT", "7550"))
+
+# Every adopted camera gets its own pair of ports: one media-in and one
+# FLV-out, derived from these bases plus the camera's registry index. The
+# destination port the camera is told to dial therefore *is* its identity, so
+# no source-IP heuristics are needed to correlate a media connection with the
+# camera that opened it. MEDIA_PORT/FLV_PORT are accepted as deprecated
+# aliases for the bases so existing single-camera setups keep working.
+MEDIA_PORT_BASE = int(
+    os.environ.get("MEDIA_PORT_BASE") or os.environ.get("MEDIA_PORT") or "7550")
 
 # Cleaned/genuine FLV byte stream is served here for go2rtc (or any other
-# consumer) to pull directly via `tcp://<this-host>:7551` — no ffmpeg/mediamtx
-# relay in between.
+# consumer) to pull directly via `tcp://<this-host>:<flv port>` — no
+# ffmpeg/mediamtx relay in between. The bases are spaced far apart so the two
+# ranges cannot collide as the camera count grows.
 FLV_OUTPUT_HOST = os.environ.get("FLV_HOST", "0.0.0.0")
-FLV_OUTPUT_PORT = int(os.environ.get("FLV_PORT", "7551"))
+FLV_PORT_BASE = int(
+    os.environ.get("FLV_PORT_BASE") or os.environ.get("FLV_PORT") or "7650")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CERT_DIR = os.environ.get("CERT_DIR", BASE_DIR)
+
+# Persisted MAC -> index mapping, so a camera keeps the same ports across
+# restarts (the go2rtc config references them by number).
+STATE_FILE = os.environ.get("STATE_FILE", os.path.join(BASE_DIR, "cameras.json"))
 CERTFILE = os.path.join(CERT_DIR, "cert.pem")
 KEYFILE = os.path.join(CERT_DIR, "key.pem")
 
@@ -55,7 +69,7 @@ if not CONTROLLER_HOST:
         "push).")
 
 try:
-    socket.getaddrinfo(CONTROLLER_HOST, MEDIA_PORT)
+    socket.getaddrinfo(CONTROLLER_HOST, MEDIA_PORT_BASE)
 except socket.gaierror as e:
     raise SystemExit(
         "CONTROLLER_HOST=%r does not resolve on this host (%s). The "
@@ -78,6 +92,17 @@ def log(msg):
 def log_err(msg):
     """Write an error message to stderr, thread-safe and unbuffered."""
     _emit(sys.stderr, msg)
+
+
+def _normalize_mac(mac):
+    """Reduce a MAC from the hello payload to bare uppercase hex, or None if
+    it is missing/unparseable. Keys the camera registry."""
+    if not isinstance(mac, str):
+        return None
+    cleaned = "".join(c for c in mac if c in "0123456789abcdefABCDEF").upper()
+    if len(cleaned) != 12:
+        return None
+    return cleaned
 
 
 def hexdump(data):
@@ -202,11 +227,12 @@ def build_envelope(function_name, payload, in_response_to=None, response_expecte
     }
 
 
-def build_arm_message():
+def build_arm_message(media_port, stream_name):
     """Build the ChangeVideoSettings message that arms video1 for h264 at
-    highest quality, pushed as extendedFlv to our media receiver (SPEC.md 3.1)."""
-    stream_name = "mockstream00001"[:16]
-    dest = "tcp://%s:%d?retryInterval=1&connectTimeout=5" % (CONTROLLER_HOST, MEDIA_PORT)
+    highest quality, pushed as extendedFlv to this camera's own media
+    receiver port (SPEC.md 3.1)."""
+    stream_name = stream_name[:16]
+    dest = "tcp://%s:%d?retryInterval=1&connectTimeout=5" % (CONTROLLER_HOST, media_port)
     payload = {
         "video": {
             "video1": {
@@ -321,6 +347,7 @@ def handle(conn, addr):
         log("=== WS handshake sent to %s ===" % (addr,))
 
         camera_name = ["UVC G6 Turret"]  # mutable holder, updated from hello payload
+        camera_cell = [None]  # resolved Camera for this connection, set at hello
 
         while True:
             opcode, payload, leftover = read_ws_frame(tls_conn, leftover)
@@ -350,11 +377,27 @@ def handle(conn, addr):
                             model = msg.get("payload", {}).get("model")
                             if model:
                                 camera_name[0] = model
+                            mac = msg.get("payload", {}).get("mac")
                             log("=== camera hello: adoptionCode=%r model=%r fw=%r mac=%r ==="
                                 % (msg.get("payload", {}).get("adoptionCode"),
                                    model,
                                    msg.get("payload", {}).get("fwVersion"),
-                                   msg.get("payload", {}).get("mac")))
+                                   mac))
+                            mac = _normalize_mac(mac)
+                            if mac:
+                                camera = REGISTRY.get_or_create(mac)
+                                camera.name = camera_name[0]
+                                camera_cell[0] = camera
+                                # Reconnect => any config tags we cached from
+                                # the previous session are stale.
+                                camera.flv.clear_config_tags()
+                                log("=== camera %s (%s) => media tcp://%s:%d, flv tcp://%s:%d ===" %
+                                    (mac, camera.name, CONTROLLER_HOST, camera.media_port,
+                                     FLV_OUTPUT_HOST, camera.flv_port))
+                            else:
+                                log_err("=== %s: hello has no usable MAC (%r); refusing to "
+                                        "arm this camera, since it has no port of its own ==="
+                                        % (addr, msg.get("payload", {}).get("mac")))
                             # Per SPEC.md 2.3: controller MUST reply to hello,
                             # regardless of responseExpected on the request.
                             hello_reply = build_envelope(
@@ -398,8 +441,14 @@ def handle(conn, addr):
                             log("=== camera authToken received: %r ===" % (auth_token,))
 
                             def _send_arm():
+                                camera = camera_cell[0]
+                                if camera is None:
+                                    log_err("=== not arming %s: no camera identified "
+                                            "(missing MAC in hello) ===" % (addr,))
+                                    return
                                 try:
-                                    arm_msg = build_arm_message()
+                                    arm_msg = build_arm_message(camera.media_port,
+                                                                camera.stream_name)
                                     arm_text = json.dumps(arm_msg)
                                     log("=== sending arm/ChangeVideoSettings to %s: %s ===" % (addr, arm_text))
                                     send_ws_frame(tls_conn, opcode, arm_text)
@@ -472,13 +521,10 @@ def recv_exact(sock, n):
     return buf
 
 
-# --- FLV broadcaster: fans the cleaned FLV byte stream out to any number of
-# pull consumers (e.g. go2rtc's `tcp://host:7551` source), skipping ffmpeg
-# and mediamtx entirely. ---
-_flv_lock = threading.Lock()
-_flv_consumers = []       # list of live consumer sockets
-_flv_last_header = None   # last FLV header + PreviousTagSize0, replayed to
-                           # new consumers that join mid-stream
+# --- FLV broadcaster: fans one camera's cleaned FLV byte stream out to any
+# number of pull consumers (e.g. go2rtc's `tcp://host:<flv port>` source),
+# skipping ffmpeg and mediamtx entirely. One instance per camera — FLV is a
+# single continuous muxed stream, so two cameras must never share one. ---
 
 # "GOP cache"-style config tags: the camera only sends these once near the
 # start of the stream (AMF onMetaData, AVC sequence header, AAC sequence
@@ -487,7 +533,6 @@ _flv_last_header = None   # last FLV header + PreviousTagSize0, replayed to
 # tracks ("streams: unknown error"). Keyed by category so we always keep
 # just the latest of each (metadata/video-config/audio-config), replayed to
 # new consumers in a fixed, sensible order.
-_flv_config_tags = {}  # category -> raw (tag_hdr + body + prevsize) bytes
 _CONFIG_ORDER = ("metadata", "video", "audio")
 
 
@@ -501,80 +546,83 @@ def _config_tag_category(tag_type, body):
     return None
 
 
-def _flv_add_consumer(sock):
-    with _flv_lock:
-        _flv_consumers.append(sock)
-        header = _flv_last_header
-        config_tags = dict(_flv_config_tags)
-    try:
-        if header:
-            sock.sendall(header)
-        for category in _CONFIG_ORDER:
-            blob = config_tags.get(category)
-            if blob:
-                sock.sendall(blob)
-    except Exception:
-        _flv_remove_consumer(sock)
+class FlvBroadcaster(object):
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._consumers = []      # list of live consumer sockets
+        self._last_header = None  # last FLV header + PreviousTagSize0, replayed
+                                  # to new consumers that join mid-stream
+        self._config_tags = {}    # category -> raw (tag_hdr + body + prevsize) bytes
 
-
-def _flv_remove_consumer(sock):
-    with _flv_lock:
-        if sock in _flv_consumers:
-            _flv_consumers.remove(sock)
-    try:
-        sock.close()
-    except Exception:
-        pass
-
-
-def _flv_broadcast(data, tag_type=None, body=None):
-    if tag_type is not None:
-        category = _config_tag_category(tag_type, body)
-        if category:
-            with _flv_lock:
-                _flv_config_tags[category] = data
-    with _flv_lock:
-        consumers = list(_flv_consumers)
-    for sock in consumers:
+    def add_consumer(self, sock):
+        with self._lock:
+            self._consumers.append(sock)
+            header = self._last_header
+            config_tags = dict(self._config_tags)
         try:
-            sock.sendall(data)
+            if header:
+                sock.sendall(header)
+            for category in _CONFIG_ORDER:
+                blob = config_tags.get(category)
+                if blob:
+                    sock.sendall(blob)
         except Exception:
-            _flv_remove_consumer(sock)
+            self.remove_consumer(sock)
+
+    def remove_consumer(self, sock):
+        with self._lock:
+            if sock in self._consumers:
+                self._consumers.remove(sock)
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def broadcast(self, data, tag_type=None, body=None):
+        if tag_type is not None:
+            category = _config_tag_category(tag_type, body)
+            if category:
+                with self._lock:
+                    self._config_tags[category] = data
+        with self._lock:
+            consumers = list(self._consumers)
+        for sock in consumers:
+            try:
+                sock.sendall(data)
+            except Exception:
+                self.remove_consumer(sock)
+
+    def set_header(self, header_bytes):
+        with self._lock:
+            self._last_header = header_bytes
+
+    def clear_config_tags(self):
+        with self._lock:
+            self._config_tags.clear()
 
 
-def _flv_set_header(header_bytes):
-    global _flv_last_header
-    with _flv_lock:
-        _flv_last_header = header_bytes
-
-
-def _flv_clear_config_tags():
-    with _flv_lock:
-        _flv_config_tags.clear()
-
-
-def flv_output_server():
+def flv_output_server(camera):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((FLV_OUTPUT_HOST, FLV_OUTPUT_PORT))
+    srv.bind((FLV_OUTPUT_HOST, camera.flv_port))
     srv.listen(5)
-    log("FLV output server (for go2rtc pull) listening on tcp://%s:%d" %
-        (FLV_OUTPUT_HOST, FLV_OUTPUT_PORT))
+    log("FLV output server for %s (for go2rtc pull) listening on tcp://%s:%d" %
+        (camera.mac, FLV_OUTPUT_HOST, camera.flv_port))
     while True:
         conn, addr = srv.accept()
-        log("=== FLV consumer connected: %s ===" % (addr,))
-        _flv_add_consumer(conn)
+        log("=== FLV consumer connected to %s: %s ===" % (camera.mac, addr))
+        camera.flv.add_consumer(conn)
 
 
-def handle_media(conn, addr):
+def handle_media(conn, addr, camera):
     """Accept the camera's plain-TCP extendedFlv media push (SPEC.md 3.2).
 
     extendedFlv is regular FLV with a 16-byte trailer appended after every
     tag's standard 4-byte PreviousTagSize field. We strip that trailer and
-    broadcast the resulting genuine FLV bytes to any connected consumers
-    (e.g. go2rtc pulling via tcp://lappy:7551) — no ffmpeg/mediamtx needed.
+    broadcast the resulting genuine FLV bytes to any consumers connected to
+    this camera's own FLV output port — no ffmpeg/mediamtx needed.
     """
-    log("=== MEDIA connection from %s ===" % (addr,))
+    log("=== MEDIA connection from %s for %s ===" % (addr, camera.mac))
     try:
         header = recv_exact(conn, 9)
         if header is None or header[:3] != b"FLV":
@@ -582,9 +630,9 @@ def handle_media(conn, addr):
             return
         log("=== MEDIA %s: FLV header %s ===" % (addr, hexdump(header)))
         header_and_prevsize0 = header + struct.pack("!I", 0)
-        _flv_set_header(header_and_prevsize0)
-        _flv_clear_config_tags()  # fresh camera connection => old config tags are stale
-        _flv_broadcast(header_and_prevsize0)
+        camera.flv.set_header(header_and_prevsize0)
+        camera.flv.clear_config_tags()  # fresh camera connection => old config tags are stale
+        camera.flv.broadcast(header_and_prevsize0)
 
         prevsize = recv_exact(conn, 4)  # wire's PreviousTagSize0, discard (we recompute our own)
         if prevsize is None:
@@ -613,8 +661,8 @@ def handle_media(conn, addr):
             if tag_type in KNOWN_TAG_TYPES:
                 # Recompute PreviousTagSize ourselves since we may have
                 # excised non-standard tags in between.
-                _flv_broadcast(tag_hdr + body + struct.pack("!I", 11 + data_size),
-                               tag_type=tag_type, body=body)
+                camera.flv.broadcast(tag_hdr + body + struct.pack("!I", 11 + data_size),
+                                     tag_type=tag_type, body=body)
                 forwarded_count += 1
 
             prevsize2 = recv_exact(conn, 4)  # wire's PreviousTagSize, discard
@@ -654,27 +702,134 @@ def handle_media(conn, addr):
         log("=== MEDIA connection from %s closed ===" % (addr,))
 
 
-def media_server():
+def media_server(camera):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((MEDIA_HOST, MEDIA_PORT))
+    srv.bind((MEDIA_HOST, camera.media_port))
     srv.listen(5)
-    log("Media (extendedFlv) server listening on tcp://%s:%d" % (MEDIA_HOST, MEDIA_PORT))
+    log("Media (extendedFlv) server for %s listening on tcp://%s:%d" %
+        (camera.mac, MEDIA_HOST, camera.media_port))
     while True:
         conn, addr = srv.accept()
-        t = threading.Thread(target=handle_media, args=(conn, addr))
+        t = threading.Thread(target=handle_media, args=(conn, addr, camera))
         t.daemon = True
         t.start()
 
 
-def main():
-    media_thread = threading.Thread(target=media_server)
-    media_thread.daemon = True
-    media_thread.start()
+# --- Camera registry: MAC -> Camera, with deterministic, persisted port
+# assignment. The camera's MAC is available from ubnt_avclient_hello, which
+# arrives well before the arm message fires, so ports can always be allocated
+# in time. There is no cap on camera count. ---
 
-    flv_out_thread = threading.Thread(target=flv_output_server)
-    flv_out_thread.daemon = True
-    flv_out_thread.start()
+
+class Camera(object):
+    def __init__(self, mac, index):
+        self.mac = mac
+        self.index = index
+        self.name = "UVC G6 Turret"
+        self.media_port = MEDIA_PORT_BASE + index
+        self.flv_port = FLV_PORT_BASE + index
+        self.flv = FlvBroadcaster()
+        self._started = False
+        self._start_lock = threading.Lock()
+
+    @property
+    def stream_name(self):
+        """Unique per-camera stream name, within extendedFlv's 16-char limit."""
+        return ("cam" + self.mac)[:16]
+
+    def start_listeners(self):
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
+        for target in (media_server, flv_output_server):
+            t = threading.Thread(target=self._run_listener, args=(target,))
+            t.daemon = True
+            t.start()
+
+    def _run_listener(self, target):
+        try:
+            target(self)
+        except Exception as e:
+            log_err("=== listener %s for %s failed: %r ===" %
+                    (target.__name__, self.mac, e))
+
+
+class CameraRegistry(object):
+    def __init__(self, state_file):
+        self._state_file = state_file
+        self._lock = threading.Lock()
+        self._cameras = {}
+        self._indexes = self._load()
+
+    def _load(self):
+        try:
+            with open(self._state_file, "r") as fh:
+                data = json.load(fh)
+        except IOError:
+            return {}
+        except Exception as e:
+            log_err("=== camera state file %s is unreadable (%r); starting "
+                    "from an empty registry ===" % (self._state_file, e))
+            return {}
+        if not isinstance(data, dict):
+            log_err("=== camera state file %s is malformed; starting from an "
+                    "empty registry ===" % (self._state_file,))
+            return {}
+        indexes = {}
+        for mac, index in data.items():
+            if isinstance(index, int):
+                indexes[mac] = index
+        return indexes
+
+    def _save(self):
+        """Atomic write: temp file in the same directory, then rename."""
+        tmp = self._state_file + ".tmp"
+        try:
+            directory = os.path.dirname(self._state_file)
+            if directory and not os.path.isdir(directory):
+                os.makedirs(directory)
+            with open(tmp, "w") as fh:
+                json.dump(self._indexes, fh, indent=2, sort_keys=True)
+            os.rename(tmp, self._state_file)
+        except Exception as e:
+            log_err("=== failed to persist camera state to %s: %r ===" %
+                    (self._state_file, e))
+
+    def get_or_create(self, mac):
+        with self._lock:
+            camera = self._cameras.get(mac)
+            if camera is not None:
+                return camera
+            index = self._indexes.get(mac)
+            if index is None:
+                used = set(self._indexes.values())
+                index = 0
+                while index in used:
+                    index += 1
+                self._indexes[mac] = index
+                self._save()
+                log("=== allocated camera %s index=%d media=%d flv=%d ===" %
+                    (mac, index, MEDIA_PORT_BASE + index, FLV_PORT_BASE + index))
+            camera = Camera(mac, index)
+            self._cameras[mac] = camera
+        camera.start_listeners()
+        return camera
+
+    def known_macs(self):
+        with self._lock:
+            return sorted(self._indexes.keys())
+
+
+REGISTRY = CameraRegistry(STATE_FILE)
+
+
+def main():
+    # Start listeners eagerly for every camera we already know about, so
+    # go2rtc can reconnect to its FLV port before the camera re-adopts.
+    for mac in REGISTRY.known_macs():
+        REGISTRY.get_or_create(mac)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

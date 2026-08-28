@@ -3,3 +3,4 @@ logs/
 *.pem
 __pycache__/
 *.pyc
+cameras.json
