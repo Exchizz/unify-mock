@@ -111,6 +111,9 @@ streams:
 ## Web interface (port 18081)
 
 A small status and management page is served on `http://<this-host>:18081`.
+
+![The status page, listing one adopted camera with its MAC, model, IP, online/offline state, go2rtc source, media port, consumer count, forwarded bytes and a delete button](docs/web-ui.png)
+
 It lists every adopted camera with:
 
 - its **MAC address** (the registry key) and reported model,
