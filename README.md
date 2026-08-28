@@ -24,6 +24,9 @@ re-implements just enough of that protocol to:
 4. Serve that clean FLV stream on a plain TCP port that go2rtc (or
    anything else that understands FLV) can pull directly via
    `tcp://<host>:<port>`.
+5. Show which cameras are adopted, whether each is currently streaming,
+   and which port to point go2rtc at — over a small web interface, which
+   also lets you delete cameras you no longer use.
 
 ## Architecture
 
@@ -45,6 +48,10 @@ raw TCP extendedFlv  ────────►  :7550+n  strip 16-byte trailer
                                         ▼
                                 clean FLV byte stream ──────────►  :7650+n  pulled via
                                                                    tcp://<host>:7650+n
+
+browser  ───────────────────►  :18081  status web interface
+                                (adopted cameras, online/offline,
+                                 go2rtc port, delete)
 ```
 
 Each adopted camera gets its **own pair of ports** (`n` is that camera's
@@ -96,6 +103,39 @@ streams:
   cam_yard: tcp://<this-host>:7650
 ```
 
+## Web interface (port 18081)
+
+A small status and management page is served on `http://<this-host>:18081`.
+It lists every adopted camera with:
+
+- its **MAC address** (the registry key) and reported model,
+- whether it is **online** (currently pushing media) or **offline**,
+- the **`tcp://` source to paste into go2rtc**, plus the media ingest port,
+- how many consumers are attached and how much clean FLV has been forwarded,
+- a **Delete** button for cameras that are no longer in use.
+
+The page refreshes itself every 5 seconds. The same data is available as
+JSON at `/api/cameras` if you'd rather script against it, and `/healthz`
+returns `ok` for container health checks.
+
+"Online" means the camera has an open media connection **and** has sent data
+within the last `STREAM_IDLE_TIMEOUT` seconds (default 10). The extra
+condition matters because a camera that loses power or network can leave a
+half-open TCP connection behind, which would otherwise look like a live
+stream indefinitely.
+
+### Deleting a camera
+
+Deleting removes the camera from the registry and the state file, closes its
+listeners and drops any live media/consumer connections, so its ports are
+released immediately. Its index becomes free, so the **next** camera to adopt
+may reuse those ports — remember to update your go2rtc config. If the deleted
+camera adopts again later it is treated as brand new and may be assigned
+different ports.
+
+The page is unauthenticated, like the rest of this project, so keep it on a
+trusted network. Set `WEB_HOST=127.0.0.1` to bind it to loopback only.
+
 ## Multiple cameras
 
 Any number of cameras can be adopted and streamed concurrently. Each one
@@ -122,15 +162,19 @@ re-adopts.
 
 ### Finding a camera's FLV port
 
-Both the registry allocation and each adoption log the mapping to stdout:
+The easiest way is the [web interface](#web-interface-port-18081), which
+shows the ready-to-paste `tcp://` source for each camera. Both the registry
+allocation and each adoption also log the mapping to stdout:
 
 ```
 === allocated camera 8CEDE15055EB index=0 media=7550 flv=7650 ===
 === camera 8CEDE15055EB (UVC G6 Turret) => media tcp://192.168.1.2:7550, flv tcp://0.0.0.0:7650 ===
 ```
 
-You can also read `STATE_FILE` directly — it is a plain `{"<MAC>": <index>}`
-JSON map.
+You can also read `STATE_FILE` directly — it is a JSON map of
+`{"<MAC>": {"index": n, "name": "...", "last_seen": "..."}}`. The original
+flat `{"<MAC>": n}` format is still read, so an existing state file keeps
+working.
 
 ### go2rtc with several cameras
 
@@ -164,6 +208,9 @@ bandwidth scales linearly with the number of cameras.
 | `FLV_HOST`        | `0.0.0.0`                          | Bind address for the clean-FLV consumer output.                           |
 | `FLV_PORT_BASE`   | `7650`                             | First port of the per-camera clean-FLV output range (point go2rtc here). `FLV_PORT` is accepted as a deprecated alias. |
 | `STATE_FILE`      | `cameras.json` next to the script  | Persisted MAC → index map that keeps each camera's ports stable across restarts. |
+| `WEB_HOST`        | `0.0.0.0`                          | Bind address for the status web interface. Set to `127.0.0.1` to keep it off the LAN. |
+| `WEB_PORT`        | `18081`                            | Port for the status web interface.                                        |
+| `STREAM_IDLE_TIMEOUT` | `10`                           | Seconds without forwarded data after which a camera is shown as offline, even if its TCP connection is still open. |
 | `DEVICE_TIMEZONE` | `CET-1CEST,M3.5.0,M10.5.0/3`       | POSIX TZ string sent in `ChangeDeviceSettings`. Note: on the tested camera this field is reporting-only and does not actually change the camera's clock — see [Known limitations](#known-limitations). |
 | `CERT_DIR`        | directory containing the script    | Directory to read/write `cert.pem`/`key.pem`.                             |
 
@@ -201,6 +248,9 @@ restarts.
 # hostname the camera can resolve) first
 docker compose up -d --build
 ```
+
+Then open `http://<this-host>:18081` to see adopted cameras and their
+go2rtc ports.
 
 `network_mode: host` is used deliberately: the camera initiates both the
 control connection and the raw media push directly to this host's IP, and

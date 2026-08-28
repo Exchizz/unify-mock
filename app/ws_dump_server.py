@@ -12,12 +12,16 @@ import hashlib
 import json
 import os
 import random
+import select
 import socket
 import ssl
 import struct
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs, urlparse
 
 HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 PORT = int(os.environ.get("LISTEN_PORT", "18080"))
@@ -54,6 +58,17 @@ CERT_DIR = os.environ.get("CERT_DIR", BASE_DIR)
 # Persisted MAC -> index mapping, so a camera keeps the same ports across
 # restarts (the go2rtc config references them by number).
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(BASE_DIR, "cameras.json"))
+
+# Status/management web interface: lists adopted cameras, whether each is
+# streaming, the port go2rtc should pull from, and allows deleting cameras
+# that are no longer in use.
+WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.environ.get("WEB_PORT", "18081"))
+
+# A camera counts as online only if it has forwarded a tag within this many
+# seconds; a half-open TCP connection that has gone silent is not a live
+# stream.
+STREAM_IDLE_TIMEOUT = float(os.environ.get("STREAM_IDLE_TIMEOUT", "10"))
 CERTFILE = os.path.join(CERT_DIR, "cert.pem")
 KEYFILE = os.path.join(CERT_DIR, "key.pem")
 
@@ -388,6 +403,7 @@ def handle(conn, addr):
                                 camera = REGISTRY.get_or_create(mac)
                                 camera.name = camera_name[0]
                                 camera_cell[0] = camera
+                                REGISTRY.touch(mac)
                                 # Reconnect => any config tags we cached from
                                 # the previous session are stale.
                                 camera.flv.clear_config_tags()
@@ -600,18 +616,51 @@ class FlvBroadcaster(object):
         with self._lock:
             self._config_tags.clear()
 
+    def consumer_count(self):
+        with self._lock:
+            return len(self._consumers)
+
+    def close_all(self):
+        with self._lock:
+            consumers = list(self._consumers)
+            self._consumers = []
+        for sock in consumers:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
 
 def flv_output_server(camera):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((FLV_OUTPUT_HOST, camera.flv_port))
     srv.listen(5)
+    camera.register_listener(srv)
     log("FLV output server for %s (for go2rtc pull) listening on tcp://%s:%d" %
         (camera.mac, FLV_OUTPUT_HOST, camera.flv_port))
-    while True:
-        conn, addr = srv.accept()
+    while not camera.deleted:
+        # Short select timeout rather than a blocking accept(), so deleting a
+        # camera can tear its listeners down promptly and portably.
+        try:
+            readable, _, _ = select.select([srv], [], [], 0.5)
+        except Exception:
+            break
+        if not readable:
+            continue
+        try:
+            conn, addr = srv.accept()
+        except Exception:
+            break
+        if camera.deleted:
+            conn.close()
+            break
         log("=== FLV consumer connected to %s: %s ===" % (camera.mac, addr))
         camera.flv.add_consumer(conn)
+    try:
+        srv.close()
+    except Exception:
+        pass
 
 
 def handle_media(conn, addr, camera):
@@ -623,6 +672,7 @@ def handle_media(conn, addr, camera):
     this camera's own FLV output port — no ffmpeg/mediamtx needed.
     """
     log("=== MEDIA connection from %s for %s ===" % (addr, camera.mac))
+    camera.media_started(conn)
     try:
         header = recv_exact(conn, 9)
         if header is None or header[:3] != b"FLV":
@@ -664,6 +714,7 @@ def handle_media(conn, addr, camera):
                 camera.flv.broadcast(tag_hdr + body + struct.pack("!I", 11 + data_size),
                                      tag_type=tag_type, body=body)
                 forwarded_count += 1
+                camera.note_tag(11 + data_size)
 
             prevsize2 = recv_exact(conn, 4)  # wire's PreviousTagSize, discard
             if prevsize2 is None:
@@ -695,6 +746,7 @@ def handle_media(conn, addr, camera):
     except Exception as e:
         log_err("=== MEDIA %s error: %r ===" % (addr, e))
     finally:
+        camera.media_stopped(conn)
         try:
             conn.close()
         except Exception:
@@ -707,13 +759,30 @@ def media_server(camera):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((MEDIA_HOST, camera.media_port))
     srv.listen(5)
+    camera.register_listener(srv)
     log("Media (extendedFlv) server for %s listening on tcp://%s:%d" %
         (camera.mac, MEDIA_HOST, camera.media_port))
-    while True:
-        conn, addr = srv.accept()
+    while not camera.deleted:
+        try:
+            readable, _, _ = select.select([srv], [], [], 0.5)
+        except Exception:
+            break
+        if not readable:
+            continue
+        try:
+            conn, addr = srv.accept()
+        except Exception:
+            break
+        if camera.deleted:
+            conn.close()
+            break
         t = threading.Thread(target=handle_media, args=(conn, addr, camera))
         t.daemon = True
         t.start()
+    try:
+        srv.close()
+    except Exception:
+        pass
 
 
 # --- Camera registry: MAC -> Camera, with deterministic, persisted port
@@ -723,20 +792,78 @@ def media_server(camera):
 
 
 class Camera(object):
-    def __init__(self, mac, index):
+    def __init__(self, mac, index, name=None, last_seen=None):
         self.mac = mac
         self.index = index
-        self.name = "UVC G6 Turret"
+        self.name = name or "UVC G6 Turret"
+        self.last_seen = last_seen  # ISO string, last control-channel hello
         self.media_port = MEDIA_PORT_BASE + index
         self.flv_port = FLV_PORT_BASE + index
         self.flv = FlvBroadcaster()
+        self.deleted = False
         self._started = False
         self._start_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._listeners = []       # bound server sockets, closed on delete
+        self._media_conns = set()  # live camera->us media pushes
+        self.last_tag_at = None    # monotonic-ish wall clock of last forwarded tag
+        self.tag_count = 0
+        self.byte_count = 0
 
     @property
     def stream_name(self):
         """Unique per-camera stream name, within extendedFlv's 16-char limit."""
         return ("cam" + self.mac)[:16]
+
+    # --- liveness ---
+
+    def media_started(self, conn):
+        with self._state_lock:
+            self._media_conns.add(conn)
+
+    def media_stopped(self, conn):
+        with self._state_lock:
+            self._media_conns.discard(conn)
+
+    def note_tag(self, nbytes):
+        with self._state_lock:
+            self.last_tag_at = time.time()
+            self.tag_count += 1
+            self.byte_count += nbytes
+
+    def is_streaming(self):
+        """Online means the camera is pushing media *and* has done so
+        recently — a half-open TCP connection that has gone quiet is not a
+        live stream."""
+        with self._state_lock:
+            if not self._media_conns:
+                return False
+            last = self.last_tag_at
+        return last is not None and (time.time() - last) <= STREAM_IDLE_TIMEOUT
+
+    def status(self):
+        return {
+            "mac": self.mac,
+            "name": self.name,
+            "index": self.index,
+            "media_port": self.media_port,
+            "flv_port": self.flv_port,
+            "stream_name": self.stream_name,
+            "online": self.is_streaming(),
+            "media_connections": len(self._media_conns),
+            "flv_consumers": self.flv.consumer_count(),
+            "tag_count": self.tag_count,
+            "byte_count": self.byte_count,
+            "last_tag_at": self.last_tag_at,
+            "last_seen": self.last_seen,
+            "flv_url": "tcp://%s:%d" % (CONTROLLER_HOST, self.flv_port),
+        }
+
+    # --- lifecycle ---
+
+    def register_listener(self, sock):
+        with self._state_lock:
+            self._listeners.append(sock)
 
     def start_listeners(self):
         with self._start_lock:
@@ -755,15 +882,35 @@ class Camera(object):
             log_err("=== listener %s for %s failed: %r ===" %
                     (target.__name__, self.mac, e))
 
+    def shutdown(self):
+        """Stop this camera's listeners and drop every live connection, so its
+        ports are free for reuse by a future camera."""
+        self.deleted = True
+        with self._state_lock:
+            listeners = list(self._listeners)
+            media = list(self._media_conns)
+            self._listeners = []
+        self.flv.close_all()
+        for sock in listeners + media:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
 
 class CameraRegistry(object):
     def __init__(self, state_file):
         self._state_file = state_file
         self._lock = threading.Lock()
         self._cameras = {}
-        self._indexes = self._load()
+        self._entries = self._load()
 
     def _load(self):
+        """Read the persisted MAC -> {index, name} map.
+
+        Also accepts the original flat ``{mac: index}`` format so an existing
+        state file keeps working.
+        """
         try:
             with open(self._state_file, "r") as fh:
                 data = json.load(fh)
@@ -777,21 +924,35 @@ class CameraRegistry(object):
             log_err("=== camera state file %s is malformed; starting from an "
                     "empty registry ===" % (self._state_file,))
             return {}
-        indexes = {}
-        for mac, index in data.items():
-            if isinstance(index, int):
-                indexes[mac] = index
-        return indexes
+        entries = {}
+        for mac, value in data.items():
+            if isinstance(value, int):
+                entries[mac] = {"index": value, "name": None, "last_seen": None}
+            elif isinstance(value, dict) and isinstance(value.get("index"), int):
+                entries[mac] = {
+                    "index": value["index"],
+                    "name": value.get("name"),
+                    "last_seen": value.get("last_seen"),
+                }
+        return entries
 
     def _save(self):
-        """Atomic write: temp file in the same directory, then rename."""
+        """Atomic write: temp file in the same directory, then rename.
+
+        Caller must hold the lock.
+        """
+        for mac, entry in self._entries.items():
+            camera = self._cameras.get(mac)
+            if camera is not None:
+                entry["name"] = camera.name
+                entry["last_seen"] = camera.last_seen
         tmp = self._state_file + ".tmp"
         try:
             directory = os.path.dirname(self._state_file)
             if directory and not os.path.isdir(directory):
                 os.makedirs(directory)
             with open(tmp, "w") as fh:
-                json.dump(self._indexes, fh, indent=2, sort_keys=True)
+                json.dump(self._entries, fh, indent=2, sort_keys=True)
             os.rename(tmp, self._state_file)
         except Exception as e:
             log_err("=== failed to persist camera state to %s: %r ===" %
@@ -802,27 +963,268 @@ class CameraRegistry(object):
             camera = self._cameras.get(mac)
             if camera is not None:
                 return camera
-            index = self._indexes.get(mac)
-            if index is None:
-                used = set(self._indexes.values())
+            entry = self._entries.get(mac)
+            if entry is None:
+                used = set(e["index"] for e in self._entries.values())
                 index = 0
                 while index in used:
                     index += 1
-                self._indexes[mac] = index
+                entry = {"index": index, "name": None, "last_seen": None}
+                self._entries[mac] = entry
                 self._save()
                 log("=== allocated camera %s index=%d media=%d flv=%d ===" %
                     (mac, index, MEDIA_PORT_BASE + index, FLV_PORT_BASE + index))
-            camera = Camera(mac, index)
+            camera = Camera(mac, entry["index"], name=entry.get("name"),
+                            last_seen=entry.get("last_seen"))
             self._cameras[mac] = camera
         camera.start_listeners()
         return camera
 
+    def touch(self, mac):
+        """Record that we just heard from this camera, and persist its name."""
+        with self._lock:
+            camera = self._cameras.get(mac)
+            if camera is None:
+                return
+            camera.last_seen = now_iso()
+            self._save()
+
+    def delete(self, mac):
+        """Forget a camera: free its index, tear down its listeners and drop
+        its connections. If it ever adopts again it is treated as new and may
+        be given a different index."""
+        with self._lock:
+            entry = self._entries.pop(mac, None)
+            camera = self._cameras.pop(mac, None)
+            if entry is None and camera is None:
+                return False
+            self._save()
+        if camera is not None:
+            camera.shutdown()
+        log("=== deleted camera %s (freed index %s) ===" %
+            (mac, entry["index"] if entry else "?"))
+        return True
+
     def known_macs(self):
         with self._lock:
-            return sorted(self._indexes.keys())
+            return sorted(self._entries.keys())
+
+    def statuses(self):
+        """Status for every known camera, including ones that have never
+        streamed since startup."""
+        with self._lock:
+            entries = dict(self._entries)
+            cameras = dict(self._cameras)
+        out = []
+        for mac in sorted(entries, key=lambda m: entries[m]["index"]):
+            camera = cameras.get(mac)
+            if camera is not None:
+                out.append(camera.status())
+            else:
+                index = entries[mac]["index"]
+                out.append({
+                    "mac": mac,
+                    "name": entries[mac].get("name") or "unknown",
+                    "index": index,
+                    "media_port": MEDIA_PORT_BASE + index,
+                    "flv_port": FLV_PORT_BASE + index,
+                    "stream_name": ("cam" + mac)[:16],
+                    "online": False,
+                    "media_connections": 0,
+                    "flv_consumers": 0,
+                    "tag_count": 0,
+                    "byte_count": 0,
+                    "last_tag_at": None,
+                    "last_seen": entries[mac].get("last_seen"),
+                    "flv_url": "tcp://%s:%d" % (CONTROLLER_HOST, FLV_PORT_BASE + index),
+                })
+        return out
 
 
 REGISTRY = CameraRegistry(STATE_FILE)
+
+
+# --- Status/management web interface ---
+
+_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>unifi-controller \u2014 cameras</title>
+<style>
+ :root { color-scheme: light dark; }
+ body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        margin: 2rem auto; max-width: 60rem; padding: 0 1rem; line-height: 1.45; }
+ h1 { margin-bottom: .25rem; font-size: 1.4rem; }
+ .sub { opacity: .7; font-size: .85rem; margin-top: 0; }
+ table { border-collapse: collapse; width: 100%%; margin-top: 1.5rem; font-size: .9rem; }
+ th, td { text-align: left; padding: .55rem .6rem; border-bottom: 1px solid rgba(128,128,128,.3); }
+ th { font-weight: 600; font-size: .78rem; text-transform: uppercase;
+      letter-spacing: .04em; opacity: .7; }
+ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; }
+ .dot { display: inline-block; width: .55rem; height: .55rem; border-radius: 50%%;
+        margin-right: .4rem; vertical-align: baseline; }
+ .online .dot { background: #21a35a; }
+ .offline .dot { background: #999; }
+ .online { color: #21a35a; font-weight: 600; }
+ .offline { opacity: .65; }
+ .empty { margin-top: 2rem; opacity: .7; }
+ button { font: inherit; padding: .3rem .7rem; border-radius: .35rem;
+          border: 1px solid rgba(128,128,128,.5); background: transparent;
+          color: inherit; cursor: pointer; }
+ button:hover { border-color: #c0392b; color: #c0392b; }
+ .note { margin-top: 2rem; font-size: .82rem; opacity: .7; }
+ .flash { margin-top: 1rem; padding: .6rem .8rem; border-radius: .35rem;
+          background: rgba(33,163,90,.15); font-size: .88rem; }
+</style>
+</head>
+<body>
+<h1>Adopted cameras</h1>
+<p class="sub">%(count)d camera(s) \u00b7 controller <code>%(controller)s</code> \u00b7 refreshes every %(refresh)ds</p>
+%(flash)s
+%(body)s
+<p class="note">A camera is <strong>online</strong> when it is pushing media and has
+sent data within the last %(idle)gs. Deleting a camera frees its slot and stops its
+ports; if it adopts again it is treated as new and may get different ports.</p>
+<script>
+setTimeout(function () { location.replace(location.pathname); }, %(refresh)d000);
+</script>
+</body>
+</html>
+"""
+
+_REFRESH_SECONDS = 5
+
+
+def _esc(text):
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _human_bytes(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return "%.0f %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+def _render_page(flash=None):
+    cameras = REGISTRY.statuses()
+    if cameras:
+        rows = []
+        for cam in cameras:
+            state = "online" if cam["online"] else "offline"
+            rows.append(
+                "<tr>"
+                "<td><code>%s</code></td>"
+                "<td>%s</td>"
+                "<td class=\"%s\"><span class=\"dot\"></span>%s</td>"
+                "<td><code>%s</code></td>"
+                "<td><code>%d</code></td>"
+                "<td>%s</td>"
+                "<td>%s</td>"
+                "<td><form method=\"post\" action=\"delete\" "
+                "onsubmit=\"return confirm('Delete camera %s? Its ports stop "
+                "immediately and go2rtc will lose this stream.')\">"
+                "<input type=\"hidden\" name=\"mac\" value=\"%s\">"
+                "<button type=\"submit\">Delete</button></form></td>"
+                "</tr>" % (
+                    _esc(cam["mac"]),
+                    _esc(cam["name"]),
+                    state,
+                    state,
+                    _esc(cam["flv_url"]),
+                    cam["media_port"],
+                    "%d" % cam["flv_consumers"],
+                    _human_bytes(cam["byte_count"]) if cam["byte_count"] else "\u2014",
+                    _esc(cam["mac"]),
+                    _esc(cam["mac"]),
+                ))
+        body = (
+            "<table><thead><tr>"
+            "<th>MAC</th><th>Model</th><th>Status</th>"
+            "<th>go2rtc source</th><th>Media port</th>"
+            "<th>Consumers</th><th>Forwarded</th><th></th>"
+            "</tr></thead><tbody>%s</tbody></table>" % "".join(rows))
+    else:
+        body = ("<p class=\"empty\">No cameras adopted yet. Point a camera at "
+                "this controller and it will appear here.</p>")
+
+    return _PAGE_TEMPLATE % {
+        "count": len(cameras),
+        "controller": _esc(CONTROLLER_HOST),
+        "refresh": _REFRESH_SECONDS,
+        "idle": STREAM_IDLE_TIMEOUT,
+        "flash": "<p class=\"flash\">%s</p>" % _esc(flash) if flash else "",
+        "body": body,
+    }
+
+
+class StatusHandler(BaseHTTPRequestHandler):
+    server_version = "unifi-controller"
+    protocol_version = "HTTP/1.1"
+
+    def _respond(self, status, body, content_type="text/html; charset=utf-8"):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path == "/":
+            flash = parse_qs(urlparse(self.path).query).get("deleted", [None])[0]
+            self._respond(200, _render_page(
+                "Deleted camera %s." % flash if flash else None))
+        elif path == "/api/cameras":
+            self._respond(200, json.dumps(REGISTRY.statuses(), indent=2),
+                          "application/json")
+        elif path == "/healthz":
+            self._respond(200, "ok", "text/plain; charset=utf-8")
+        else:
+            self._respond(404, "not found", "text/plain; charset=utf-8")
+
+    def do_POST(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path != "/delete":
+            self._respond(404, "not found", "text/plain; charset=utf-8")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+        mac = _normalize_mac(parse_qs(raw).get("mac", [""])[0])
+        if not mac:
+            self._respond(400, "bad or missing mac", "text/plain; charset=utf-8")
+            return
+        if not REGISTRY.delete(mac):
+            self._respond(404, "no such camera", "text/plain; charset=utf-8")
+            return
+        # POST/redirect/GET so a refresh doesn't repeat the delete.
+        self.send_response(303)
+        self.send_header("Location", "/?deleted=%s" % mac)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        log("=== WEB %s %s ===" % (self.address_string(), fmt % args))
+
+
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def web_server():
+    httpd = _ThreadingHTTPServer((WEB_HOST, WEB_PORT), StatusHandler)
+    log("Status web interface listening on http://%s:%d" % (WEB_HOST, WEB_PORT))
+    httpd.serve_forever()
 
 
 def main():
@@ -830,6 +1232,10 @@ def main():
     # go2rtc can reconnect to its FLV port before the camera re-adopts.
     for mac in REGISTRY.known_macs():
         REGISTRY.get_or_create(mac)
+
+    web_thread = threading.Thread(target=web_server)
+    web_thread.daemon = True
+    web_thread.start()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

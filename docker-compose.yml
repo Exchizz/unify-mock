@@ -18,9 +18,12 @@ services:
       CONTROLLER_HOST: "192.168.1.2"
       # Optional overrides (defaults shown):
       # LISTEN_PORT: "18080"
+      # WEB_PORT: "18081"          # status page: http://<host>:18081
+      # WEB_HOST: "0.0.0.0"        # set 127.0.0.1 to keep the page off the LAN
       # MEDIA_PORT_BASE: "7550"
       # FLV_PORT_BASE: "7650"
       # STATE_FILE: "/data/cameras.json"
+      # STREAM_IDLE_TIMEOUT: "10"
       # DEVICE_TIMEZONE: "CET-1CEST,M3.5.0,M10.5.0/3"
       CERT_DIR: "/certs"
     volumes:
