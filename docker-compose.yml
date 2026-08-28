@@ -21,13 +21,17 @@ services:
       # told to dial this address back for its media (FLV) push after
       # adoption.
       CONTROLLER_HOST: "192.168.1.2"
+      # Where the MAC -> port-index map is written. Must point into the
+      # mounted volume below, otherwise it lands in the container's
+      # ephemeral filesystem and cameras are re-indexed (and change ports)
+      # every time the container is recreated.
+      STATE_FILE: "/data/cameras.json"
       # Optional overrides (defaults shown):
       # LISTEN_PORT: "18080"
       # WEB_PORT: "18081"          # status page: http://<host>:18081
       # WEB_HOST: "0.0.0.0"        # set 127.0.0.1 to keep the page off the LAN
       # MEDIA_PORT_BASE: "7550"
       # FLV_PORT_BASE: "7650"
-      # STATE_FILE: "/data/cameras.json"
       # STREAM_IDLE_TIMEOUT: "10"
       # DEVICE_TIMEZONE: "Europe/Copenhagen"   # IANA name, not a POSIX TZ string
       CERT_DIR: "/certs"

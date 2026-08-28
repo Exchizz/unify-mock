@@ -436,7 +436,7 @@ def handle(conn, addr):
                                 camera = REGISTRY.get_or_create(mac)
                                 camera.name = camera_name[0]
                                 camera_cell[0] = camera
-                                REGISTRY.touch(mac)
+                                REGISTRY.touch(mac, ip=addr[0] if addr else None)
                                 # Reconnect => any config tags we cached from
                                 # the previous session are stale.
                                 camera.flv.clear_config_tags()
@@ -824,12 +824,22 @@ def media_server(camera):
 # in time. There is no cap on camera count. ---
 
 
+def camera_web_url(ip):
+    """The camera's own web UI. UniFi cameras serve it over HTTPS with a
+    self-signed cert, so browsers will warn on first visit."""
+    if not ip:
+        return None
+    host = "[%s]" % ip if ":" in ip else ip  # bracket IPv6 literals
+    return "https://%s/" % host
+
+
 class Camera(object):
-    def __init__(self, mac, index, name=None, last_seen=None):
+    def __init__(self, mac, index, name=None, last_seen=None, ip=None):
         self.mac = mac
         self.index = index
         self.name = name or "UVC G6 Turret"
         self.last_seen = last_seen  # ISO string, last control-channel hello
+        self.ip = ip               # last address we saw it connect from
         self.media_port = MEDIA_PORT_BASE + index
         self.flv_port = FLV_PORT_BASE + index
         self.flv = FlvBroadcaster()
@@ -889,6 +899,8 @@ class Camera(object):
             "byte_count": self.byte_count,
             "last_tag_at": self.last_tag_at,
             "last_seen": self.last_seen,
+            "ip": self.ip,
+            "web_url": camera_web_url(self.ip),
             "flv_url": "tcp://%s:%d" % (CONTROLLER_HOST, self.flv_port),
         }
 
@@ -939,7 +951,7 @@ class CameraRegistry(object):
         self._entries = self._load()
 
     def _load(self):
-        """Read the persisted MAC -> {index, name} map.
+        """Read the persisted MAC -> {index, name, last_seen, ip} map.
 
         Also accepts the original flat ``{mac: index}`` format so an existing
         state file keeps working.
@@ -960,12 +972,14 @@ class CameraRegistry(object):
         entries = {}
         for mac, value in data.items():
             if isinstance(value, int):
-                entries[mac] = {"index": value, "name": None, "last_seen": None}
+                entries[mac] = {"index": value, "name": None,
+                                "last_seen": None, "ip": None}
             elif isinstance(value, dict) and isinstance(value.get("index"), int):
                 entries[mac] = {
                     "index": value["index"],
                     "name": value.get("name"),
                     "last_seen": value.get("last_seen"),
+                    "ip": value.get("ip"),
                 }
         return entries
 
@@ -979,6 +993,7 @@ class CameraRegistry(object):
             if camera is not None:
                 entry["name"] = camera.name
                 entry["last_seen"] = camera.last_seen
+                entry["ip"] = camera.ip
         tmp = self._state_file + ".tmp"
         try:
             directory = os.path.dirname(self._state_file)
@@ -1002,24 +1017,29 @@ class CameraRegistry(object):
                 index = 0
                 while index in used:
                     index += 1
-                entry = {"index": index, "name": None, "last_seen": None}
+                entry = {"index": index, "name": None, "last_seen": None,
+                         "ip": None}
                 self._entries[mac] = entry
                 self._save()
                 log("=== allocated camera %s index=%d media=%d flv=%d ===" %
                     (mac, index, MEDIA_PORT_BASE + index, FLV_PORT_BASE + index))
             camera = Camera(mac, entry["index"], name=entry.get("name"),
-                            last_seen=entry.get("last_seen"))
+                            last_seen=entry.get("last_seen"),
+                            ip=entry.get("ip"))
             self._cameras[mac] = camera
         camera.start_listeners()
         return camera
 
-    def touch(self, mac):
-        """Record that we just heard from this camera, and persist its name."""
+    def touch(self, mac, ip=None):
+        """Record that we just heard from this camera, and persist its name
+        and the address it connected from."""
         with self._lock:
             camera = self._cameras.get(mac)
             if camera is None:
                 return
             camera.last_seen = now_iso()
+            if ip:
+                camera.ip = ip
             self._save()
 
     def delete(self, mac):
@@ -1069,6 +1089,8 @@ class CameraRegistry(object):
                     "byte_count": 0,
                     "last_tag_at": None,
                     "last_seen": entries[mac].get("last_seen"),
+                    "ip": entries[mac].get("ip"),
+                    "web_url": camera_web_url(entries[mac].get("ip")),
                     "flv_url": "tcp://%s:%d" % (CONTROLLER_HOST, FLV_PORT_BASE + index),
                 })
         return out
@@ -1103,6 +1125,9 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
  .online { color: #21a35a; font-weight: 600; }
  .offline { opacity: .65; }
  .empty { margin-top: 2rem; opacity: .7; }
+ .unknown { opacity: .45; }
+ td a { color: #2d7dd2; text-decoration: none; }
+ td a:hover { text-decoration: underline; }
  button { font: inherit; padding: .3rem .7rem; border-radius: .35rem;
           border: 1px solid rgba(128,128,128,.5); background: transparent;
           color: inherit; cursor: pointer; }
@@ -1148,9 +1173,16 @@ def _render_page(flash=None):
         rows = []
         for cam in cameras:
             state = "online" if cam["online"] else "offline"
+            if cam.get("web_url"):
+                ip_cell = ("<a href=\"%s\" target=\"_blank\" rel=\"noopener\">"
+                           "<code>%s</code></a>"
+                           % (_esc(cam["web_url"]), _esc(cam["ip"])))
+            else:
+                ip_cell = "<span class=\"unknown\">\u2014</span>"
             rows.append(
                 "<tr>"
                 "<td><code>%s</code></td>"
+                "<td>%s</td>"
                 "<td>%s</td>"
                 "<td class=\"%s\"><span class=\"dot\"></span>%s</td>"
                 "<td><code>%s</code></td>"
@@ -1165,6 +1197,7 @@ def _render_page(flash=None):
                 "</tr>" % (
                     _esc(cam["mac"]),
                     _esc(cam["name"]),
+                    ip_cell,
                     state,
                     state,
                     _esc(cam["flv_url"]),
@@ -1176,7 +1209,7 @@ def _render_page(flash=None):
                 ))
         body = (
             "<table><thead><tr>"
-            "<th>MAC</th><th>Model</th><th>Status</th>"
+            "<th>MAC</th><th>Model</th><th>IP</th><th>Status</th>"
             "<th>go2rtc source</th><th>Media port</th>"
             "<th>Consumers</th><th>Forwarded</th><th></th>"
             "</tr></thead><tbody>%s</tbody></table>" % "".join(rows))

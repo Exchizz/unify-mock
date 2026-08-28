@@ -34,8 +34,9 @@ re-implements just enough of that protocol to:
 UniFi camera                     this container                    go2rtc / Frigate
 ------------                     ---------------                    -----------------
 TLS+WS "inform"  ───────────►  :18080  control/adoption logic
-                                (hello, arm, authToken, adopt,
-                                 ChangeDeviceSettings, LED off, ...)
+                                (hello, paramAgreement/authToken,
+                                 timeSync, arm, ChangeDeviceSettings,
+                                 LED off, ...)
 
 raw TCP extendedFlv  ────────►  :7550+n  strip 16-byte trailer,
                                 drop non-standard tag types,
@@ -65,12 +66,16 @@ The camera connects here first (`GET /camera/1.0/ws`) to perform its
 - Terminates TLS (self-signed cert, generated on first start — see
   [TLS certificate](#tls-certificate) below).
 - Completes the WebSocket upgrade.
-- Implements just enough of the JSON message protocol (`hello`, arm/
-  authToken exchange, `Adopt`, `ChangeDeviceSettings`,
-  `ChangeSoundLedSettings`) to satisfy the camera's adoption flow and tell
-  it where to push media (`CONTROLLER_HOST:<that camera's media port>`).
-- Also sends a `ChangeSoundLedSettings` message shortly after adoption to
-  turn off the camera's status LED.
+- Implements just enough of the JSON message protocol to satisfy the
+  camera's adoption flow and tell it where to push media
+  (`CONTROLLER_HOST:<that camera's media port>`). Inbound it handles
+  `ubnt_avclient_hello`, `ubnt_avclient_paramAgreement` (which carries the
+  camera's `authToken`) and `ubnt_avclient_timeSync`; outbound it sends the
+  hello reply, `paramAgreement`, `ChangeVideoSettings` (the "arm" message),
+  `ChangeDeviceSettings` and `ChangeSoundLedSettings`.
+- Sends `ChangeDeviceSettings` shortly after adoption to set the camera's
+  timezone (see [Setting the camera's timezone](#setting-the-cameras-timezone)),
+  and `ChangeSoundLedSettings` to turn off its status LED.
 
 ### Media ingest (ports 7550+n, plain TCP)
 
@@ -109,6 +114,7 @@ A small status and management page is served on `http://<this-host>:18081`.
 It lists every adopted camera with:
 
 - its **MAC address** (the registry key) and reported model,
+- its **IP address**, linked to the camera's own web UI,
 - whether it is **online** (currently pushing media) or **offline**,
 - the **`tcp://` source to paste into go2rtc**, plus the media ingest port,
 - how many consumers are attached and how much clean FLV has been forwarded,
@@ -123,6 +129,11 @@ within the last `STREAM_IDLE_TIMEOUT` seconds (default 10). The extra
 condition matters because a camera that loses power or network can leave a
 half-open TCP connection behind, which would otherwise look like a live
 stream indefinitely.
+
+The IP shown is the address the camera last connected to the control channel
+from, so it appears once a camera has adopted at least once and is remembered
+across restarts. It links to `https://<ip>/`, the camera's own web UI — which
+uses a self-signed certificate, so your browser will warn on first visit.
 
 ### Deleting a camera
 
@@ -172,9 +183,9 @@ allocation and each adoption also log the mapping to stdout:
 ```
 
 You can also read `STATE_FILE` directly — it is a JSON map of
-`{"<MAC>": {"index": n, "name": "...", "last_seen": "..."}}`. The original
-flat `{"<MAC>": n}` format is still read, so an existing state file keeps
-working.
+`{"<MAC>": {"index": n, "name": "...", "last_seen": "...", "ip": "..."}}`.
+The original flat `{"<MAC>": n}` format is still read, so an existing state
+file keeps working.
 
 ### go2rtc with several cameras
 
@@ -207,12 +218,13 @@ bandwidth scales linearly with the number of cameras.
 | `MEDIA_PORT_BASE` | `7550`                             | First port of the per-camera extendedFlv ingest range. `MEDIA_PORT` is accepted as a deprecated alias. |
 | `FLV_HOST`        | `0.0.0.0`                          | Bind address for the clean-FLV consumer output.                           |
 | `FLV_PORT_BASE`   | `7650`                             | First port of the per-camera clean-FLV output range (point go2rtc here). `FLV_PORT` is accepted as a deprecated alias. |
-| `STATE_FILE`      | `cameras.json` next to the script  | Persisted MAC → index map that keeps each camera's ports stable across restarts. |
+| `STATE_FILE`      | `cameras.json` next to the script  | Persisted MAC → index map that keeps each camera's ports stable across restarts. Under Docker this **must** point into the mounted volume (`docker-compose.yml` sets `/data/cameras.json`), or it is lost whenever the container is recreated. |
 | `WEB_HOST`        | `0.0.0.0`                          | Bind address for the status web interface. Set to `127.0.0.1` to keep it off the LAN. |
 | `WEB_PORT`        | `18081`                            | Port for the status web interface.                                        |
 | `STREAM_IDLE_TIMEOUT` | `10`                           | Seconds without forwarded data after which a camera is shown as offline, even if its TCP connection is still open. |
 | `DEVICE_TIMEZONE` | `Europe/Copenhagen`                | IANA zone name pushed to the camera in `ChangeDeviceSettings` at adoption, so its clock and OSD show local time instead of UTC. Must be an IANA name, not a POSIX TZ string — see [Setting the camera's timezone](#setting-the-cameras-timezone). |
 | `CERT_DIR`        | directory containing the script    | Directory to read/write `cert.pem`/`key.pem`.                             |
+| `CERT_CN`         | `unifi-controller`                 | Common Name for the self-signed cert `entrypoint.sh` generates. Only used when no cert exists yet. |
 
 The two port bases are spaced far apart so the ranges cannot collide as the
 camera count grows. If you override them, keep that gap wider than your
@@ -324,26 +336,6 @@ date                                     # should show local time, e.g. CEST
 ls -l /etc/localtime                     # -> /usr/share/zoneinfo/Europe/Copenhagen
 grep timezone /etc/persistent/system.cfg # system.timezone=Europe/Copenhagen
 ```
-
-You can also query it without changing anything:
-
-```sh
-ubnt_ipc_cli -z -r=1 -T=ubnt_ctlserver -m='{"functionName":"GetTimezone"}'
-```
-
-or set it directly on the camera, bypassing the controller entirely (note the
-fields sit at the **top level** for the local IPC form, not nested under
-`payload`):
-
-```sh
-ubnt_ipc_cli -z -r=1 -T=ubnt_ctlserver \
-  -m='{"functionName":"ChangeDeviceSettings","timezone":"Europe/Copenhagen","persists":true}'
-```
-
-The `persists` flag asks the camera to write the value to flash rather than
-only applying it to the running system.
-
-#### Note on the OSD clock
 
 Long-running processes cache the zone at startup, so a camera that was
 already streaming may keep rendering UTC on its overlay until it restarts.
