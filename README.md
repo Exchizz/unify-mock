@@ -211,7 +211,7 @@ bandwidth scales linearly with the number of cameras.
 | `WEB_HOST`        | `0.0.0.0`                          | Bind address for the status web interface. Set to `127.0.0.1` to keep it off the LAN. |
 | `WEB_PORT`        | `18081`                            | Port for the status web interface.                                        |
 | `STREAM_IDLE_TIMEOUT` | `10`                           | Seconds without forwarded data after which a camera is shown as offline, even if its TCP connection is still open. |
-| `DEVICE_TIMEZONE` | `CET-1CEST,M3.5.0,M10.5.0/3`       | POSIX TZ string sent in `ChangeDeviceSettings`. Note: on the tested camera this field is reporting-only and does not actually change the camera's clock — see [Known limitations](#known-limitations). |
+| `DEVICE_TIMEZONE` | `CET-1CEST,M3.5.0,M10.5.0/3`       | POSIX TZ string (Copenhagen/Central European) sent in `ChangeDeviceSettings`. Note: on the tested camera this field is reporting-only and does not actually change the camera's clock — see [Setting the camera's timezone](#setting-the-cameras-timezone). |
 | `CERT_DIR`        | directory containing the script    | Directory to read/write `cert.pem`/`key.pem`.                             |
 
 The two port bases are spaced far apart so the ranges cannot collide as the
@@ -278,6 +278,54 @@ The host entry carries no `https://` scheme — the transport is set by
 `"protocol":"wss"` instead, and including a scheme makes the camera fail to
 parse the destination.
 
+### Setting the camera's timezone
+
+The `DEVICE_TIMEZONE` env var is sent in `ChangeDeviceSettings`, but on the
+tested firmware that field is reporting-only and does **not** move the
+camera's OSD clock. To actually change it you need shell access on the camera
+and must write its persistent config directly.
+
+SSH into the camera (default credentials `ubnt`/`ubnt` unless changed), then
+for **Copenhagen**:
+
+```sh
+ubnt_system_cfg write system.timezone 'CET-1CEST,M3.5.0,M10.5.0/3'
+reboot
+```
+
+Some firmware builds keep the setter under a different name; if
+`ubnt_system_cfg` isn't on `PATH`, edit the file directly instead:
+
+```sh
+sed -i '/^system\.timezone=/d' /etc/persistent/system.cfg
+echo "system.timezone=CET-1CEST,M3.5.0,M10.5.0/3" >> /etc/persistent/system.cfg
+cfgmtd -w -p /etc/persistent/    # commit to flash, else the reboot loses it
+reboot
+```
+
+Verify after it comes back up:
+
+```sh
+grep system.timezone /etc/persistent/system.cfg
+date
+```
+
+This is a **POSIX TZ string**, not an IANA name like `Europe/Copenhagen` —
+the camera has no tz database. Reading `CET-1CEST,M3.5.0,M10.5.0/3`:
+
+| Part | Meaning |
+|------|---------|
+| `CET` | standard-time abbreviation |
+| `-1` | offset **west** of UTC; the sign is inverted, so `-1` means UTC**+**1 |
+| `CEST` | daylight-saving abbreviation (offset defaults to standard + 1h) |
+| `M3.5.0` | DST starts: month 3, last (`5`) Sunday (`0`) |
+| `M10.5.0/3` | DST ends: month 10, last Sunday, at 03:00 |
+
+The inverted sign is the usual trap — `CET-1CEST` is Central European Time
+at UTC+1, not UTC−1. The same string covers Oslo, Stockholm, Berlin, Paris
+and Amsterdam. It is also this project's `DEVICE_TIMEZONE` default, so if
+you're in Copenhagen you only need the camera-side command above.
+
 ## Known limitations
 
 - `ChangeDeviceSettings`'s `timezone` field appears to be **camera → 
@@ -285,8 +333,8 @@ parse the destination.
   5.0.83) — sending it does not change the camera's on-screen clock. The
   camera's actual timezone lives in its own persistent config
   (`/etc/persistent/system.cfg`, key `system.timezone`) and requires
-  camera-side shell access (`ubnt_system_cfg write system.timezone <TZ>`)
-  plus a reboot to take effect.
+  camera-side shell access plus a reboot to take effect — see
+  [Setting the camera's timezone](#setting-the-cameras-timezone).
 - `ChangeSoundLedSettings` is implemented as a best-effort controller→
   camera setter based on `unifi-cam-proxy`'s protocol implementation, but
   has not been exhaustively verified across camera models/firmware.
