@@ -839,16 +839,20 @@ class FlvBroadcaster(object):
         return base - first_ts
 
     def note_out_ts(self, tag_type, out_ts):
-        """Clamp ``out_ts`` so this tag type's output never moves backwards.
+        """Force ``out_ts`` strictly forwards for this tag type.
 
-        ffmpeg checks DTS monotonicity per output stream, so the guarantee has
-        to hold per tag type. Re-anchoring should make this a no-op; it is the
-        backstop that makes a backwards timestamp impossible to emit.
+        ffmpeg checks DTS monotonicity per output stream and rejects a
+        *repeated* timestamp just as it rejects a backwards one ("non
+        monotonically increasing dts"). Equal timestamps are also how RTP
+        marks packets belonging to the same access unit, so emitting two
+        frames with one timestamp makes go2rtc merge and drop them.
+        Re-anchoring should make this a no-op; it is the backstop that makes
+        an un-muxable timestamp impossible to emit.
         """
         with self._ts_lock:
             last = self._last_out_by_type.get(tag_type)
-            if last is not None and out_ts < last:
-                out_ts = last
+            if last is not None and out_ts <= last:
+                out_ts = last + 1
             self._last_out_by_type[tag_type] = out_ts
             if self._last_out_ts is None or out_ts > self._last_out_ts:
                 self._last_out_ts = out_ts
