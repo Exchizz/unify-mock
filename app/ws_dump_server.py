@@ -600,18 +600,66 @@ def _flv_tag_timestamp(tag_hdr):
     return (tag_hdr[4] << 16) | (tag_hdr[5] << 8) | tag_hdr[6] | (tag_hdr[7] << 24)
 
 
-def _flv_rebase_timestamp(tag_hdr, ts_offset):
-    """Rewrite an FLV tag header's timestamp by ``ts_offset`` milliseconds."""
-    out_ts = _flv_tag_timestamp(tag_hdr) + ts_offset
-    if out_ts < 0:
-        out_ts = 0
+def _flv_write_timestamp(tag_hdr, out_ts):
+    """Rewrite an FLV tag header's 24-bit timestamp plus its extended byte."""
     out_ts &= 0xFFFFFFFF
     new_hdr = bytearray(tag_hdr)
     new_hdr[4] = (out_ts >> 16) & 0xFF
     new_hdr[5] = (out_ts >> 8) & 0xFF
     new_hdr[6] = out_ts & 0xFF
     new_hdr[7] = (out_ts >> 24) & 0xFF
-    return bytes(new_hdr), out_ts
+    return bytes(new_hdr)
+
+
+class _TimestampRebaser(object):
+    """Maps one camera push's timestamps onto the camera's output clock.
+
+    The camera's timeline can restart *within* a single push (its encoder
+    re-starting), not just between pushes, and both tracks jump together when
+    it does. Anchoring once per connection would forward that jump straight to
+    consumers, so any large discontinuity re-anchors instead. A shared offset
+    is used for every tag type, which keeps A/V sync across the re-anchor.
+    """
+
+    BACKWARD_TOLERANCE_MS = 1000    # normal A/V interleave, not a restart
+    FORWARD_TOLERANCE_MS = 30000    # a bigger gap means the clock jumped
+
+    def __init__(self, flv, label=""):
+        self._flv = flv
+        self._label = label
+        self._offset = None
+        self._last_raw = {}  # tag type -> last raw timestamp seen
+
+    def map(self, tag_type, raw_ts):
+        # Config/metadata tags carry timestamp 0 rather than a position on the
+        # media timeline, so they must not count as a discontinuity — that
+        # would re-anchor a second time and shift A/V sync at startup.
+        if raw_ts == 0 and self._offset is not None:
+            return self._flv.note_out_ts(tag_type, max(0, self._offset))
+        last_raw = self._last_raw.get(tag_type)
+        reason = None
+        if self._offset is None:
+            reason = "start"
+        elif last_raw is not None:
+            if raw_ts < last_raw - self.BACKWARD_TOLERANCE_MS:
+                reason = "backwards jump"
+            elif raw_ts > last_raw + self.FORWARD_TOLERANCE_MS:
+                reason = "forward jump"
+        if reason:
+            self._offset = self._flv.ts_offset_for(raw_ts)
+            log("=== MEDIA %s: timeline %s (camera ts=%d, previous=%s), "
+                "re-anchoring with offset=%d ===" %
+                (self._label, reason, raw_ts, last_raw, self._offset))
+            # One discontinuity, one re-anchor: the other tracks jumped too,
+            # and re-anchoring again on their first tag would shift the shared
+            # offset a second time and skew A/V sync.
+            self._last_raw = {}
+        if raw_ts:
+            self._last_raw[tag_type] = raw_ts
+        out_ts = raw_ts + self._offset
+        if out_ts < 0:
+            out_ts = 0
+        return self._flv.note_out_ts(tag_type, out_ts)
 
 
 class _Consumer(object):
@@ -646,6 +694,7 @@ class FlvBroadcaster(object):
         self._config_tags = {}    # category -> raw (tag_hdr + body + prevsize) bytes
         self._ts_lock = threading.Lock()
         self._last_out_ts = None  # highest timestamp (ms) emitted so far
+        self._last_out_by_type = {}  # tag type -> last timestamp emitted
 
     def add_consumer(self, sock):
         consumer = _Consumer(sock)
@@ -756,10 +805,21 @@ class FlvBroadcaster(object):
                     else self._last_out_ts + self.TS_RECONNECT_GAP_MS)
         return base - first_ts
 
-    def note_out_ts(self, out_ts):
+    def note_out_ts(self, tag_type, out_ts):
+        """Clamp ``out_ts`` so this tag type's output never moves backwards.
+
+        ffmpeg checks DTS monotonicity per output stream, so the guarantee has
+        to hold per tag type. Re-anchoring should make this a no-op; it is the
+        backstop that makes a backwards timestamp impossible to emit.
+        """
         with self._ts_lock:
+            last = self._last_out_by_type.get(tag_type)
+            if last is not None and out_ts < last:
+                out_ts = last
+            self._last_out_by_type[tag_type] = out_ts
             if self._last_out_ts is None or out_ts > self._last_out_ts:
                 self._last_out_ts = out_ts
+        return out_ts
 
     def clear_config_tags(self):
         with self._lock:
@@ -851,7 +911,7 @@ def handle_media(conn, addr, camera):
 
         tag_count = 0
         forwarded_count = 0
-        ts_offset = None
+        rebaser = _TimestampRebaser(camera.flv, label=str(addr))
         while True:
             tag_hdr = recv_exact(conn, 11)
             if tag_hdr is None:
@@ -869,13 +929,8 @@ def handle_media(conn, addr, camera):
                     log("=== MEDIA %s: superseded by a newer connection, dropping ===" %
                         (addr,))
                     break
-                if ts_offset is None:
-                    raw_ts = _flv_tag_timestamp(tag_hdr)
-                    ts_offset = camera.flv.ts_offset_for(raw_ts)
-                    log("=== MEDIA %s: rebasing timestamps, camera ts=%d offset=%d ===" %
-                        (addr, raw_ts, ts_offset))
-                out_hdr, out_ts = _flv_rebase_timestamp(tag_hdr, ts_offset)
-                camera.flv.note_out_ts(out_ts)
+                out_ts = rebaser.map(tag_type, _flv_tag_timestamp(tag_hdr))
+                out_hdr = _flv_write_timestamp(tag_hdr, out_ts)
                 # A consumer that joins mid-GOP can't decode until the next
                 # keyframe, so flag them for the broadcaster.
                 is_keyframe = (tag_type == 9 and len(body) >= 2 and

@@ -90,11 +90,15 @@ demuxer can't parse. This process:
 - Recomputes each tag's `PreviousTagSize` field (since dropped tags would
   otherwise break the chain).
 - Rebases tag timestamps onto a continuous per-camera output clock. The
-  camera's FLV timestamps are uptime-based and restart near zero every time
-  it reconnects and re-pushes; forwarding them verbatim makes DTS jump
-  backwards for consumers that stayed connected across the reconnect
-  (ffmpeg: `Non-monotonic DTS`). Each new push is offset so its first tag
-  lands just after the last timestamp emitted for that camera.
+  camera's FLV timestamps are uptime-based and its timeline can restart
+  near zero — both when it reconnects *and* mid-push, with every track
+  jumping together. Forwarding a restart verbatim makes DTS jump backwards
+  for anything already consuming the stream (ffmpeg: `Non-monotonic DTS`).
+  Any large jump — backwards, or a big gap forwards — re-anchors the
+  stream to just after the last timestamp emitted for that camera. One
+  discontinuity produces exactly one re-anchor, shared by every track, so
+  A/V sync is preserved across it. As a backstop, the timestamp emitted for
+  a given tag type can never move backwards.
 - Serves only one push per camera at a time: a new media connection retires
   the previous one, so two overlapping pushes can't interleave two
   independent timelines into the same output.
