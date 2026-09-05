@@ -130,20 +130,16 @@ Any client connecting here becomes a broadcast consumer: it immediately
 receives the cached FLV header + cached codec config tags, then joins the
 live tag stream at the next video keyframe.
 
-Point go2rtc at it with an `ffmpeg:` source in copy mode:
+Point go2rtc at it with a plain `tcp://` stream source (no query strings or
+ffmpeg needed):
 
 ```yaml
 streams:
-  cam_yard: ffmpeg:tcp://<this-host>:7650#video=copy#audio=copy
+  cam_yard: tcp://<this-host>:7650
 ```
 
-A bare `tcp://<this-host>:7650` source also connects and plays, but go2rtc's
-own FLV producer drops roughly a quarter of the frames (measured 459 of 597
-over 20 s) and collapses distinct frames onto equal RTP timestamps. Frigate
-then sees a frame-starved, jittery stream and its ffmpeg logs `Non-monotonic
-DTS` and restarts on a loop. The `ffmpeg:` form hands parsing to ffmpeg
-instead, which reads this stream cleanly at full frame rate. Nothing is
-re-encoded — `#video=copy#audio=copy` is still a straight remux.
+If Frigate logs `Non-monotonic DTS` and restarts ffmpeg on a loop, see
+[Troubleshooting a restart loop](#troubleshooting-a-restart-loop).
 
 ## Web interface (port 18081)
 
@@ -231,10 +227,51 @@ file keeps working.
 
 ```yaml
 streams:
-  cam_yard: ffmpeg:tcp://<this-host>:7650#video=copy#audio=copy  # 8CEDE15055EB, index 0
-  cam_door: ffmpeg:tcp://<this-host>:7651#video=copy#audio=copy  # 8CEDE15055FF, index 1
-  cam_shed: ffmpeg:tcp://<this-host>:7652#video=copy#audio=copy  # index 2
+  cam_yard: tcp://<this-host>:7650      # 8CEDE15055EB, index 0
+  cam_door: tcp://<this-host>:7651      # 8CEDE15055FF, index 1
+  cam_shed: tcp://<this-host>:7652      # index 2
 ```
+
+### Troubleshooting a restart loop
+
+If Frigate logs `Non-monotonic DTS` followed by `watchdog … Restarting
+ffmpeg`, work through these in order — the first two are by far the most
+common causes and neither is a timestamp problem:
+
+1. **Match `detect.fps` to the stream.** These cameras push 30 fps. Frigate
+   kills ffmpeg once measured frame rate reaches `detect.fps + 10`, and
+   `detect.fps` defaults to 5 — a guaranteed restart every ~50 s regardless
+   of timestamps, and every restart re-anchors DTS. Either set `fps: 30`
+   under `detect:`, or downsample in the output args:
+   `-r 5` in `ffmpeg.output_args.detect`.
+
+2. **Restart Frigate after deploying this container.** Our output clock
+   restarts near zero on container start, so any Frigate ffmpeg session that
+   survives the deploy sees a large backwards jump. Errors in the first
+   minutes after a `docker compose up -d` are expected and mean nothing.
+
+3. **Measure with `-fps_mode passthrough`.** `-f null` decodes and re-emits
+   through `wrapped_avframe`, whose timebase comes from a *guessed* frame
+   rate. Against a 30 fps stream it quantises onto a coarser grid, which
+   invents both dropped frames and `non monotonically increasing dts to
+   muxer` warnings that do not exist in the stream:
+
+   ```
+   ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:8554/cam_yard \
+       -t 20 -map 0:v -fps_mode passthrough -f null -
+   ```
+
+   Compare that against reading this container's port directly
+   (`-i tcp://<this-host>:7650`) to tell our output apart from the rest of
+   the chain.
+
+4. **As a fallback, hand parsing to ffmpeg** instead of go2rtc's own FLV
+   producer. Nothing is re-encoded — this is still a straight remux:
+
+   ```yaml
+   streams:
+     cam_yard: ffmpeg:tcp://<this-host>:7650#video=copy#audio=copy
+   ```
 
 ### Audio and video are one stream, not two
 

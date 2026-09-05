@@ -1067,13 +1067,11 @@ def camera_web_url(ip):
 def go2rtc_source(flv_port):
     """The stream source to paste into go2rtc for a camera's FLV port.
 
-    Deliberately the `ffmpeg:` form rather than a bare `tcp://`. Both connect,
-    but go2rtc's own FLV producer drops roughly a quarter of the frames and
-    collapses distinct frames onto equal RTP timestamps, which makes Frigate's
-    ffmpeg log non-monotonic DTS and restart on a loop. `#video=copy#audio=copy`
-    remuxes without re-encoding, so this costs nothing.
+    go2rtc reads this FLV output natively, so a plain `tcp://` source needs no
+    query strings and no ffmpeg. If a downstream consumer struggles with it,
+    README's "Troubleshooting a restart loop" covers the `ffmpeg:` fallback.
     """
-    return "ffmpeg:tcp://%s:%d#video=copy#audio=copy" % (CONTROLLER_HOST, flv_port)
+    return "tcp://%s:%d" % (CONTROLLER_HOST, flv_port)
 
 
 class Camera(object):
