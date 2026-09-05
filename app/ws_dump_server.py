@@ -614,6 +614,23 @@ def _flv_rebase_timestamp(tag_hdr, ts_offset):
     return bytes(new_hdr), out_ts
 
 
+class _Consumer(object):
+    """One FLV pull consumer, with its own send lock.
+
+    Every write to the socket goes through ``lock``, so the join payload
+    (FLV header + cached config tags, written from the accept thread) can
+    never be interleaved with a live tag written by the media thread — that
+    corrupts the byte stream and makes demuxers like go2rtc drop and
+    reconnect in a loop.
+    """
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.lock = threading.Lock()
+        self.joined = False        # join payload fully written
+        self.want_keyframe = True  # hold live tags until a decodable start
+
+
 class FlvBroadcaster(object):
     # Nudge applied after a camera reconnect, so the new stream's first tag
     # lands strictly after the last timestamp we emitted.
@@ -621,7 +638,7 @@ class FlvBroadcaster(object):
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._consumers = []      # list of live consumer sockets
+        self._consumers = []      # list of _Consumer
         self._pending_header = []  # consumers that connected before any FLV
                                    # header was seen; they get it on arrival
         self._last_header = None  # last FLV header + PreviousTagSize0, replayed
@@ -631,46 +648,84 @@ class FlvBroadcaster(object):
         self._last_out_ts = None  # highest timestamp (ms) emitted so far
 
     def add_consumer(self, sock):
+        consumer = _Consumer(sock)
         with self._lock:
-            self._consumers.append(sock)
+            self._consumers.append(consumer)
             header = self._last_header
             if header is None:
-                self._pending_header.append(sock)
+                # No camera stream yet; publish_header() finishes the join.
+                self._pending_header.append(consumer)
+                return
             config_tags = dict(self._config_tags)
-        try:
-            if header:
-                sock.sendall(header)
+        self._send_join(consumer, header, config_tags)
+
+    def _send_join(self, consumer, header, config_tags):
+        """Write header + cached config tags, then mark the consumer live."""
+        with consumer.lock:
+            if consumer.joined:
+                return
+            try:
+                consumer.sock.sendall(header)
                 for category in _CONFIG_ORDER:
                     blob = config_tags.get(category)
                     if blob:
-                        sock.sendall(blob)
-        except Exception:
-            self.remove_consumer(sock)
+                        consumer.sock.sendall(blob)
+                consumer.joined = True
+                return
+            except Exception:
+                pass
+        self._drop(consumer)
 
-    def remove_consumer(self, sock):
+    def _drop(self, consumer):
         with self._lock:
-            if sock in self._consumers:
-                self._consumers.remove(sock)
-            if sock in self._pending_header:
-                self._pending_header.remove(sock)
+            if consumer in self._consumers:
+                self._consumers.remove(consumer)
+            if consumer in self._pending_header:
+                self._pending_header.remove(consumer)
         try:
-            sock.close()
+            consumer.sock.close()
         except Exception:
             pass
 
-    def broadcast(self, data, tag_type=None, body=None):
+    def remove_consumer(self, sock):
+        with self._lock:
+            found = [c for c in self._consumers if c.sock is sock]
+        for consumer in found:
+            self._drop(consumer)
+        if not found:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def broadcast(self, data, tag_type=None, body=None, keyframe=False):
+        is_config = False
         if tag_type is not None:
             category = _config_tag_category(tag_type, body)
             if category:
+                is_config = True
                 with self._lock:
                     self._config_tags[category] = data
         with self._lock:
             consumers = list(self._consumers)
-        for sock in consumers:
-            try:
-                sock.sendall(data)
-            except Exception:
-                self.remove_consumer(sock)
+        for consumer in consumers:
+            failed = False
+            with consumer.lock:
+                if not consumer.joined:
+                    continue  # still joining; it gets the cached tags instead
+                if consumer.want_keyframe and not is_config:
+                    # Starting a consumer mid-GOP gives it undecodable frames
+                    # until the next keyframe; wait for one instead.
+                    if not keyframe:
+                        continue
+                    consumer.want_keyframe = False
+                try:
+                    consumer.sock.sendall(data)
+                except Exception:
+                    failed = True
+            if failed:
+                log("=== FLV consumer dropped (send failed) ===")
+                self._drop(consumer)
 
     def publish_header(self, header_bytes):
         """Record the FLV header, sending it only to consumers without one.
@@ -683,11 +738,9 @@ class FlvBroadcaster(object):
             self._last_header = header_bytes
             pending = list(self._pending_header)
             del self._pending_header[:]
-        for sock in pending:
-            try:
-                sock.sendall(header_bytes)
-            except Exception:
-                self.remove_consumer(sock)
+            config_tags = dict(self._config_tags)
+        for consumer in pending:
+            self._send_join(consumer, header_bytes, config_tags)
 
     # --- output timeline ---
     #
@@ -721,9 +774,9 @@ class FlvBroadcaster(object):
             consumers = list(self._consumers)
             self._consumers = []
             del self._pending_header[:]
-        for sock in consumers:
+        for consumer in consumers:
             try:
-                sock.close()
+                consumer.sock.close()
             except Exception:
                 pass
 
@@ -823,10 +876,15 @@ def handle_media(conn, addr, camera):
                         (addr, raw_ts, ts_offset))
                 out_hdr, out_ts = _flv_rebase_timestamp(tag_hdr, ts_offset)
                 camera.flv.note_out_ts(out_ts)
+                # A consumer that joins mid-GOP can't decode until the next
+                # keyframe, so flag them for the broadcaster.
+                is_keyframe = (tag_type == 9 and len(body) >= 2 and
+                               (body[0] >> 4) == 1 and body[1] == 1)
                 # Recompute PreviousTagSize ourselves since we may have
                 # excised non-standard tags in between.
                 camera.flv.broadcast(out_hdr + body + struct.pack("!I", 11 + data_size),
-                                     tag_type=tag_type, body=body)
+                                     tag_type=tag_type, body=body,
+                                     keyframe=is_keyframe)
                 forwarded_count += 1
                 camera.note_tag(11 + data_size)
 

@@ -108,13 +108,22 @@ demuxer can't parse. This process:
   detect zero media tracks.
 - Broadcasts the resulting clean FLV byte stream to every consumer
   connected to *that camera's* FLV output port.
+- Starts each consumer at a video keyframe. A consumer handed the middle of
+  a GOP gets inter-frames it can't decode, so go2rtc/ffmpeg produces nothing
+  and Frigate's watchdog restarts it — an endless reconnect loop, with a
+  fresh timeline (and a `Non-monotonic DTS` complaint) every time.
+- Serializes all writes to a consumer socket. The join payload (header +
+  config tags) is written from the accept thread while the media thread is
+  broadcasting live tags; without a per-consumer lock those two writes can
+  interleave and corrupt the byte stream.
 
 ### FLV output (ports 7650+n, plain TCP)
 
 Any client connecting here becomes a broadcast consumer: it immediately
-receives the cached FLV header + cached codec config tags, followed by the
-live tag stream. go2rtc can be pointed straight at this with a plain
-`tcp://` stream source (no query strings or ffmpeg needed):
+receives the cached FLV header + cached codec config tags, then joins the
+live tag stream at the next video keyframe. go2rtc can be pointed straight
+at this with a plain `tcp://` stream source (no query strings or ffmpeg
+needed):
 
 ```yaml
 streams:
