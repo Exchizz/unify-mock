@@ -595,26 +595,55 @@ def _config_tag_category(tag_type, body):
     return None
 
 
+def _flv_tag_timestamp(tag_hdr):
+    """Read an FLV tag header's 24-bit timestamp plus its extended byte."""
+    return (tag_hdr[4] << 16) | (tag_hdr[5] << 8) | tag_hdr[6] | (tag_hdr[7] << 24)
+
+
+def _flv_rebase_timestamp(tag_hdr, ts_offset):
+    """Rewrite an FLV tag header's timestamp by ``ts_offset`` milliseconds."""
+    out_ts = _flv_tag_timestamp(tag_hdr) + ts_offset
+    if out_ts < 0:
+        out_ts = 0
+    out_ts &= 0xFFFFFFFF
+    new_hdr = bytearray(tag_hdr)
+    new_hdr[4] = (out_ts >> 16) & 0xFF
+    new_hdr[5] = (out_ts >> 8) & 0xFF
+    new_hdr[6] = out_ts & 0xFF
+    new_hdr[7] = (out_ts >> 24) & 0xFF
+    return bytes(new_hdr), out_ts
+
+
 class FlvBroadcaster(object):
+    # Nudge applied after a camera reconnect, so the new stream's first tag
+    # lands strictly after the last timestamp we emitted.
+    TS_RECONNECT_GAP_MS = 40
+
     def __init__(self):
         self._lock = threading.Lock()
         self._consumers = []      # list of live consumer sockets
+        self._pending_header = []  # consumers that connected before any FLV
+                                   # header was seen; they get it on arrival
         self._last_header = None  # last FLV header + PreviousTagSize0, replayed
                                   # to new consumers that join mid-stream
         self._config_tags = {}    # category -> raw (tag_hdr + body + prevsize) bytes
+        self._ts_lock = threading.Lock()
+        self._last_out_ts = None  # highest timestamp (ms) emitted so far
 
     def add_consumer(self, sock):
         with self._lock:
             self._consumers.append(sock)
             header = self._last_header
+            if header is None:
+                self._pending_header.append(sock)
             config_tags = dict(self._config_tags)
         try:
             if header:
                 sock.sendall(header)
-            for category in _CONFIG_ORDER:
-                blob = config_tags.get(category)
-                if blob:
-                    sock.sendall(blob)
+                for category in _CONFIG_ORDER:
+                    blob = config_tags.get(category)
+                    if blob:
+                        sock.sendall(blob)
         except Exception:
             self.remove_consumer(sock)
 
@@ -622,6 +651,8 @@ class FlvBroadcaster(object):
         with self._lock:
             if sock in self._consumers:
                 self._consumers.remove(sock)
+            if sock in self._pending_header:
+                self._pending_header.remove(sock)
         try:
             sock.close()
         except Exception:
@@ -641,9 +672,41 @@ class FlvBroadcaster(object):
             except Exception:
                 self.remove_consumer(sock)
 
-    def set_header(self, header_bytes):
+    def publish_header(self, header_bytes):
+        """Record the FLV header, sending it only to consumers without one.
+
+        The header must never reach a consumer that is already mid-stream:
+        splicing a second ``FLV\\x01...`` signature into its byte stream is
+        invalid FLV and desyncs the downstream demuxer.
+        """
         with self._lock:
             self._last_header = header_bytes
+            pending = list(self._pending_header)
+            del self._pending_header[:]
+        for sock in pending:
+            try:
+                sock.sendall(header_bytes)
+            except Exception:
+                self.remove_consumer(sock)
+
+    # --- output timeline ---
+    #
+    # The camera's FLV timestamps are uptime-based and restart near zero every
+    # time it reconnects and re-pushes. Forwarding them verbatim makes DTS jump
+    # backwards for consumers that stayed connected across the reconnect
+    # (ffmpeg: "Non-monotonic DTS"), so each connection is rebased onto our own
+    # continuous output clock instead.
+
+    def ts_offset_for(self, first_ts):
+        with self._ts_lock:
+            base = (0 if self._last_out_ts is None
+                    else self._last_out_ts + self.TS_RECONNECT_GAP_MS)
+        return base - first_ts
+
+    def note_out_ts(self, out_ts):
+        with self._ts_lock:
+            if self._last_out_ts is None or out_ts > self._last_out_ts:
+                self._last_out_ts = out_ts
 
     def clear_config_tags(self):
         with self._lock:
@@ -657,6 +720,7 @@ class FlvBroadcaster(object):
         with self._lock:
             consumers = list(self._consumers)
             self._consumers = []
+            del self._pending_header[:]
         for sock in consumers:
             try:
                 sock.close()
@@ -700,22 +764,27 @@ def handle_media(conn, addr, camera):
     """Accept the camera's plain-TCP extendedFlv media push (SPEC.md 3.2).
 
     extendedFlv is regular FLV with a 16-byte trailer appended after every
-    tag's standard 4-byte PreviousTagSize field. We strip that trailer and
+    tag's standard 4-byte PreviousTagSize field. We strip that trailer, rebase
+    the camera's uptime-based timestamps onto a continuous output clock, and
     broadcast the resulting genuine FLV bytes to any consumers connected to
     this camera's own FLV output port — no ffmpeg/mediamtx needed.
     """
     log("=== MEDIA connection from %s for %s ===" % (addr, camera.mac))
-    camera.media_started(conn)
+    gen = camera.media_started(conn)
     try:
         header = recv_exact(conn, 9)
         if header is None or header[:3] != b"FLV":
             log_err("=== MEDIA %s: not an FLV header: %r ===" % (addr, header))
             return
         log("=== MEDIA %s: FLV header %s ===" % (addr, hexdump(header)))
+        if not camera.media_is_current(gen):
+            log("=== MEDIA %s: superseded by a newer connection, dropping ===" % (addr,))
+            return
         header_and_prevsize0 = header + struct.pack("!I", 0)
-        camera.flv.set_header(header_and_prevsize0)
         camera.flv.clear_config_tags()  # fresh camera connection => old config tags are stale
-        camera.flv.broadcast(header_and_prevsize0)
+        # Only reaches consumers that never got a header; mid-stream consumers
+        # keep the one they already have.
+        camera.flv.publish_header(header_and_prevsize0)
 
         prevsize = recv_exact(conn, 4)  # wire's PreviousTagSize0, discard (we recompute our own)
         if prevsize is None:
@@ -729,6 +798,7 @@ def handle_media(conn, addr, camera):
 
         tag_count = 0
         forwarded_count = 0
+        ts_offset = None
         while True:
             tag_hdr = recv_exact(conn, 11)
             if tag_hdr is None:
@@ -742,9 +812,20 @@ def handle_media(conn, addr, camera):
                 break
 
             if tag_type in KNOWN_TAG_TYPES:
+                if not camera.media_is_current(gen):
+                    log("=== MEDIA %s: superseded by a newer connection, dropping ===" %
+                        (addr,))
+                    break
+                if ts_offset is None:
+                    raw_ts = _flv_tag_timestamp(tag_hdr)
+                    ts_offset = camera.flv.ts_offset_for(raw_ts)
+                    log("=== MEDIA %s: rebasing timestamps, camera ts=%d offset=%d ===" %
+                        (addr, raw_ts, ts_offset))
+                out_hdr, out_ts = _flv_rebase_timestamp(tag_hdr, ts_offset)
+                camera.flv.note_out_ts(out_ts)
                 # Recompute PreviousTagSize ourselves since we may have
                 # excised non-standard tags in between.
-                camera.flv.broadcast(tag_hdr + body + struct.pack("!I", 11 + data_size),
+                camera.flv.broadcast(out_hdr + body + struct.pack("!I", 11 + data_size),
                                      tag_type=tag_type, body=body)
                 forwarded_count += 1
                 camera.note_tag(11 + data_size)
@@ -849,6 +930,8 @@ class Camera(object):
         self._state_lock = threading.Lock()
         self._listeners = []       # bound server sockets, closed on delete
         self._media_conns = set()  # live camera->us media pushes
+        self._media_generation = 0  # bumped per push, so a retired one stops
+                                    # broadcasting into the shared output
         self.last_tag_at = None    # monotonic-ish wall clock of last forwarded tag
         self.tag_count = 0
         self.byte_count = 0
@@ -861,8 +944,33 @@ class Camera(object):
     # --- liveness ---
 
     def media_started(self, conn):
+        """Make ``conn`` this camera's one live media push, retiring any older.
+
+        Two overlapping pushes (the previous socket not yet torn down when the
+        camera reconnects) would interleave two independent timelines into the
+        same broadcaster, which looks exactly like a non-monotonic DTS bug
+        downstream. Returns a generation token for ``media_is_current``.
+        """
         with self._state_lock:
-            self._media_conns.add(conn)
+            self._media_generation += 1
+            gen = self._media_generation
+            stale = [c for c in self._media_conns if c is not conn]
+            self._media_conns = set([conn])
+        for old in stale:
+            log("=== MEDIA %s: retiring previous media connection ===" % (self.mac,))
+            try:
+                old.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                old.close()
+            except Exception:
+                pass
+        return gen
+
+    def media_is_current(self, gen):
+        with self._state_lock:
+            return gen == self._media_generation
 
     def media_stopped(self, conn):
         with self._state_lock:

@@ -41,6 +41,7 @@ TLS+WS "inform"  ───────────►  :18080  control/adoption 
 raw TCP extendedFlv  ────────►  :7550+n  strip 16-byte trailer,
                                 drop non-standard tag types,
                                 recompute PreviousTagSize,
+                                rebase timestamps,
                                 cache codec config tags
                                         │
                                         ▼
@@ -88,6 +89,18 @@ demuxer can't parse. This process:
 - Drops non-standard tag types (keeping only audio/video/script tags).
 - Recomputes each tag's `PreviousTagSize` field (since dropped tags would
   otherwise break the chain).
+- Rebases tag timestamps onto a continuous per-camera output clock. The
+  camera's FLV timestamps are uptime-based and restart near zero every time
+  it reconnects and re-pushes; forwarding them verbatim makes DTS jump
+  backwards for consumers that stayed connected across the reconnect
+  (ffmpeg: `Non-monotonic DTS`). Each new push is offset so its first tag
+  lands just after the last timestamp emitted for that camera.
+- Serves only one push per camera at a time: a new media connection retires
+  the previous one, so two overlapping pushes can't interleave two
+  independent timelines into the same output.
+- Sends the FLV header only to consumers that don't already have one — a
+  camera reconnect must not splice a second `FLV` signature into a
+  mid-stream consumer's byte stream.
 - Caches the one-time codec config tags — the AMF `onMetaData` tag, the
   AVC sequence header, and the AAC sequence header — since the camera only
   sends these once near the start of the stream. Without replaying them to
