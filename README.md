@@ -128,14 +128,22 @@ demuxer can't parse. This process:
 
 Any client connecting here becomes a broadcast consumer: it immediately
 receives the cached FLV header + cached codec config tags, then joins the
-live tag stream at the next video keyframe. go2rtc can be pointed straight
-at this with a plain `tcp://` stream source (no query strings or ffmpeg
-needed):
+live tag stream at the next video keyframe.
+
+Point go2rtc at it with an `ffmpeg:` source in copy mode:
 
 ```yaml
 streams:
-  cam_yard: tcp://<this-host>:7650
+  cam_yard: ffmpeg:tcp://<this-host>:7650#video=copy#audio=copy
 ```
+
+A bare `tcp://<this-host>:7650` source also connects and plays, but go2rtc's
+own FLV producer drops roughly a quarter of the frames (measured 459 of 597
+over 20 s) and collapses distinct frames onto equal RTP timestamps. Frigate
+then sees a frame-starved, jittery stream and its ffmpeg logs `Non-monotonic
+DTS` and restarts on a loop. The `ffmpeg:` form hands parsing to ffmpeg
+instead, which reads this stream cleanly at full frame rate. Nothing is
+re-encoded — `#video=copy#audio=copy` is still a straight remux.
 
 ## Web interface (port 18081)
 
@@ -206,7 +214,7 @@ re-adopts.
 ### Finding a camera's FLV port
 
 The easiest way is the [web interface](#web-interface-port-18081), which
-shows the ready-to-paste `tcp://` source for each camera. Both the registry
+shows the ready-to-paste go2rtc source for each camera. Both the registry
 allocation and each adoption also log the mapping to stdout:
 
 ```
@@ -223,9 +231,9 @@ file keeps working.
 
 ```yaml
 streams:
-  cam_yard: tcp://<this-host>:7650      # 8CEDE15055EB, index 0
-  cam_door: tcp://<this-host>:7651      # 8CEDE15055FF, index 1
-  cam_shed: tcp://<this-host>:7652      # index 2
+  cam_yard: ffmpeg:tcp://<this-host>:7650#video=copy#audio=copy  # 8CEDE15055EB, index 0
+  cam_door: ffmpeg:tcp://<this-host>:7651#video=copy#audio=copy  # 8CEDE15055FF, index 1
+  cam_shed: ffmpeg:tcp://<this-host>:7652#video=copy#audio=copy  # index 2
 ```
 
 ### Audio and video are one stream, not two

@@ -1064,6 +1064,18 @@ def camera_web_url(ip):
     return "https://%s/" % host
 
 
+def go2rtc_source(flv_port):
+    """The stream source to paste into go2rtc for a camera's FLV port.
+
+    Deliberately the `ffmpeg:` form rather than a bare `tcp://`. Both connect,
+    but go2rtc's own FLV producer drops roughly a quarter of the frames and
+    collapses distinct frames onto equal RTP timestamps, which makes Frigate's
+    ffmpeg log non-monotonic DTS and restart on a loop. `#video=copy#audio=copy`
+    remuxes without re-encoding, so this costs nothing.
+    """
+    return "ffmpeg:tcp://%s:%d#video=copy#audio=copy" % (CONTROLLER_HOST, flv_port)
+
+
 class Camera(object):
     def __init__(self, mac, index, name=None, last_seen=None, ip=None):
         self.mac = mac
@@ -1160,6 +1172,7 @@ class Camera(object):
             "ip": self.ip,
             "web_url": camera_web_url(self.ip),
             "flv_url": "tcp://%s:%d" % (CONTROLLER_HOST, self.flv_port),
+            "go2rtc_source": go2rtc_source(self.flv_port),
         }
 
     # --- lifecycle ---
@@ -1350,6 +1363,7 @@ class CameraRegistry(object):
                     "ip": entries[mac].get("ip"),
                     "web_url": camera_web_url(entries[mac].get("ip")),
                     "flv_url": "tcp://%s:%d" % (CONTROLLER_HOST, FLV_PORT_BASE + index),
+                    "go2rtc_source": go2rtc_source(FLV_PORT_BASE + index),
                 })
         return out
 
@@ -1458,7 +1472,7 @@ def _render_page(flash=None):
                     ip_cell,
                     state,
                     state,
-                    _esc(cam["flv_url"]),
+                    _esc(cam["go2rtc_source"]),
                     cam["media_port"],
                     "%d" % cam["flv_consumers"],
                     _human_bytes(cam["byte_count"]) if cam["byte_count"] else "\u2014",
