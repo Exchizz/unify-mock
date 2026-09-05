@@ -94,11 +94,14 @@ demuxer can't parse. This process:
   near zero — both when it reconnects *and* mid-push, with every track
   jumping together. Forwarding a restart verbatim makes DTS jump backwards
   for anything already consuming the stream (ffmpeg: `Non-monotonic DTS`).
-  Any large jump — backwards, or a big gap forwards — re-anchors the
-  stream to just after the last timestamp emitted for that camera. One
-  discontinuity produces exactly one re-anchor, shared by every track, so
-  A/V sync is preserved across it. As a backstop, the timestamp emitted for
-  a given tag type can never move backwards.
+  A restart is only believed once a second tag confirms the new timeline,
+  and then the whole stream re-anchors on one shared offset so A/V sync is
+  preserved. Individual tags that carry a *different* clock — the camera's
+  device uptime (days) rather than its session time — are pinned to the
+  current output position and logged, because a single one of them would
+  otherwise drag the output clock days into the future with no way back.
+  As a backstop, the timestamp emitted for a given tag type can never move
+  backwards.
 - Serves only one push per camera at a time: a new media connection retires
   the previous one, so two overlapping pushes can't interleave two
   independent timelines into the same output.

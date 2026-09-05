@@ -619,6 +619,14 @@ class _TimestampRebaser(object):
     it does. Anchoring once per connection would forward that jump straight to
     consumers, so any large discontinuity re-anchors instead. A shared offset
     is used for every tag type, which keeps A/V sync across the re-anchor.
+
+    Individual tags also turn up carrying a *different* clock than the rest of
+    the push — the camera's device uptime (days) rather than its session time.
+    A single such tag must never move the output clock: it would drag the
+    stream to a timestamp days in the future, and since output is clamped
+    monotonic it could never come back. So a discontinuity is only believed
+    once a second tag confirms the new timeline; a lone outlier is pinned to
+    the current output position instead.
     """
 
     BACKWARD_TOLERANCE_MS = 1000    # normal A/V interleave, not a restart
@@ -628,34 +636,59 @@ class _TimestampRebaser(object):
         self._flv = flv
         self._label = label
         self._offset = None
-        self._last_raw = {}  # tag type -> last raw timestamp seen
+        self._timeline = None  # last raw timestamp accepted, any tag type
+        self._pending = None   # unconfirmed candidate for a new timeline
+        self._strays = 0
+
+    def _on_timeline(self, raw_ts, reference):
+        return (reference - self.BACKWARD_TOLERANCE_MS
+                <= raw_ts <=
+                reference + self.FORWARD_TOLERANCE_MS)
+
+    def _current_out(self, tag_type):
+        """Output position of the timeline, for tags with no usable stamp."""
+        return self._flv.note_out_ts(tag_type, max(0, self._timeline + self._offset))
 
     def map(self, tag_type, raw_ts):
         # Config/metadata tags carry timestamp 0 rather than a position on the
-        # media timeline, so they must not count as a discontinuity — that
-        # would re-anchor a second time and shift A/V sync at startup.
-        if raw_ts == 0 and self._offset is not None:
-            return self._flv.note_out_ts(tag_type, max(0, self._offset))
-        last_raw = self._last_raw.get(tag_type)
-        reason = None
+        # media timeline, so they must neither anchor it nor count as a
+        # discontinuity — either would shift A/V sync at startup.
+        if raw_ts == 0:
+            if self._offset is None:
+                return self._flv.note_out_ts(
+                    tag_type, max(0, self._flv.ts_offset_for(0)))
+            return self._current_out(tag_type)
+
         if self._offset is None:
-            reason = "start"
-        elif last_raw is not None:
-            if raw_ts < last_raw - self.BACKWARD_TOLERANCE_MS:
-                reason = "backwards jump"
-            elif raw_ts > last_raw + self.FORWARD_TOLERANCE_MS:
-                reason = "forward jump"
-        if reason:
             self._offset = self._flv.ts_offset_for(raw_ts)
-            log("=== MEDIA %s: timeline %s (camera ts=%d, previous=%s), "
+            self._timeline = raw_ts
+            log("=== MEDIA %s: timeline start (camera ts=%d), "
+                "anchoring with offset=%d ===" % (self._label, raw_ts, self._offset))
+        elif self._on_timeline(raw_ts, self._timeline):
+            self._pending = None
+            if raw_ts > self._timeline:
+                self._timeline = raw_ts
+        elif self._pending is not None and self._on_timeline(raw_ts, self._pending):
+            # Second tag agreeing with the candidate: the camera really did
+            # restart its clock mid-push. Re-anchor the whole stream, keeping
+            # one shared offset so A/V sync survives.
+            self._offset = self._flv.ts_offset_for(raw_ts)
+            self._timeline = raw_ts
+            self._pending = None
+            log("=== MEDIA %s: timeline restarted (camera ts=%d), "
                 "re-anchoring with offset=%d ===" %
-                (self._label, reason, raw_ts, last_raw, self._offset))
-            # One discontinuity, one re-anchor: the other tracks jumped too,
-            # and re-anchoring again on their first tag would shift the shared
-            # offset a second time and skew A/V sync.
-            self._last_raw = {}
-        if raw_ts:
-            self._last_raw[tag_type] = raw_ts
+                (self._label, raw_ts, self._offset))
+        else:
+            # Lone tag on some other clock. Pin it to where the stream
+            # currently is rather than letting it drag the output clock.
+            self._pending = raw_ts
+            self._strays += 1
+            if self._strays <= 5 or self._strays % 500 == 0:
+                log("=== MEDIA %s: ignoring off-timeline tag (type=%d, "
+                    "camera ts=%d, timeline=%d, count=%d) ===" %
+                    (self._label, tag_type, raw_ts, self._timeline, self._strays))
+            return self._current_out(tag_type)
+
         out_ts = raw_ts + self._offset
         if out_ts < 0:
             out_ts = 0
